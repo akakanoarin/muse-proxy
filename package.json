@@ -5,7 +5,8 @@
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "smoke": "node --experimental-strip-types scripts/smoke.ts"
+    "smoke": "bun run scripts/smoke.ts",
+    "eval": "bun run scripts/agent-eval.ts"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

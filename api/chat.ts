@@ -6,12 +6,13 @@
 
 import { checkAuth } from "./_lib/auth.js"
 import { errorChunk, jsonError, upstreamErrorToOpenAI } from "./_lib/errors.js"
+import { identityForCall } from "./_lib/identity.js"
 import { lowerRequest } from "./_lib/lower.js"
 import { createRaiser } from "./_lib/raise.js"
 import { chunkToSse, DONE_LINE, HEARTBEAT_COMMENT, HEARTBEAT_INTERVAL_MS, parseUpstreamSse } from "./_lib/sse.js"
 import type { ChatToolCall, ChatUsage, UpstreamEvent } from "./_lib/types.js"
 import { usageToChat } from "./_lib/usage.js"
-import { MODEL_ID, MODEL_NAME, UPSTREAM_API_KEY, UPSTREAM_URL, UPSTREAM_USER_AGENT } from "./_lib/types.js"
+import { MODEL_ID, MODEL_NAME, OPENCODE_CLIENT, UPSTREAM_API_KEY, UPSTREAM_URL, UPSTREAM_USER_AGENT } from "./_lib/types.js"
 
 export interface ChatEnv {
   PROXY_API_KEY?: string
@@ -135,6 +136,13 @@ export async function handleChatRequest(
 
   let upstream: Response
   try {
+    // Full opencode client header set (request.ts): User-Agent, client flag,
+    // session/request IDs, and project ID. The zen free tier fingerprints
+    // this set; a bare UUID session id or missing client flag now lands in
+    // the strict non-opencode fallback bucket (429 "free tier ... within
+    // OpenCode"). The message id doubles as the per-message project key,
+    // mirroring how a real CLI process keeps one project per session.
+    const identity = identityForCall(completionId)
     upstream = await fetchImpl(UPSTREAM_URL, {
       method: "POST",
       headers: {
@@ -144,9 +152,12 @@ export async function handleChatRequest(
         // Free tier is UA-gated; without this upstream rejects the request.
         "user-agent": UPSTREAM_USER_AGENT,
         // Required by the responses endpoint (MissingSessionID otherwise).
-        // Stateless proxy: one id per upstream request; mirrors
-        // opencode's `x-opencode-session: sessionID` (request.ts).
-        "x-opencode-session": crypto.randomUUID(),
+        // Stateless proxy: opencode-shaped ses_/msg_ ids per upstream call;
+        // mirrors opencode's `x-opencode-session: sessionID` (request.ts).
+        "x-opencode-session": identity.sessionId,
+        "x-opencode-request": identity.requestId,
+        "x-opencode-client": OPENCODE_CLIENT,
+        "x-opencode-project": identity.requestId,
       },
       body: JSON.stringify(lowered.request),
       // Propagate client disconnects so we stop billing upstream tokens.

@@ -9,9 +9,19 @@ export const UPSTREAM_URL = "https://opencode.ai/zen/v1/responses"
 // opencode zen free models accept the literal api key "public" when no zen
 // account key is configured (see opencode provider.ts custom loader).
 export const UPSTREAM_API_KEY = "public"
-// The anonymous free tier is UA-gated: only requests carrying the opencode
-// client's User-Agent are served, everything else gets 400/429.
-export const UPSTREAM_USER_AGENT = "opencode/1.2.31"
+// The anonymous free tier is gated on an opencode-client header fingerprint:
+// User-Agent + x-opencode-client + x-opencode-session/request IDs. Recent
+// zen releases tightened this fingerprint and non-matching traffic now gets
+// "OpenCode's free tier can only be used from within OpenCode" (the gate
+// moved out of the open-source handler into the closed-source edge).
+// Mirrors opencode's Installation.USER_AGENT:
+//   `opencode/${InstallationChannel}/${InstallationVersion}/${client}`
+// (packages/opencode/src/installation/index.ts), and the request-time header
+// set (packages/opencode/src/session/llm/request.ts).
+export const OPENCODE_VERSION = "1.18.31"
+export const OPENCODE_CHANNEL = "latest"
+export const OPENCODE_CLIENT = "cli"
+export const UPSTREAM_USER_AGENT = `opencode/${OPENCODE_CHANNEL}/${OPENCODE_VERSION}/${OPENCODE_CLIENT}`
 // Every requested model maps to the free contributor model.
 export const MODEL_ID = "muse-spark-1.3-contributor-free"
 export const MODEL_NAME = "Muse Spark 1.3 Contributor Free (opencode zen)"

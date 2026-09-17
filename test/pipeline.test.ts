@@ -134,6 +134,35 @@ describe("handleChatRequest", () => {
     expect(body.stream).toBe(true)
   })
 
+  it("sends the full opencode client header fingerprint upstream", async () => {
+    mockFetch(sseResponse([{ type: "response.completed", response: {} }]))
+    await handleChatRequest(postRequest({ messages: [{ role: "user", content: "hi" }] }), ENV)
+    const headers = calls[0]!.init!.headers as Record<string, string>
+    // Mirrors opencode Installation.USER_AGENT + request.ts header set.
+    expect(headers["user-agent"]).toBe("opencode/latest/1.18.31/cli")
+    expect(headers["x-opencode-client"]).toBe("cli")
+    expect(headers["x-opencode-session"]).toMatch(/^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
+    expect(headers["x-opencode-request"]).toMatch(/^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
+    expect(headers["x-opencode-project"]).toBeTruthy()
+    // Session and message ids differ per upstream call.
+    expect(headers["x-opencode-session"]).not.toBe(headers["x-opencode-request"])
+  })
+
+  it("mints fresh opencode ids per upstream call", async () => {
+    // Each call gets a fresh SSE Response; a cached one would be locked
+    // after its body stream is consumed by the first request.
+    mockFetch(sseResponse([{ type: "response.completed", response: {} }]))
+    await handleChatRequest(postRequest({ messages: [{ role: "user", content: "one" }] }), ENV)
+    mockFetch(sseResponse([{ type: "response.completed", response: {} }]))
+    await handleChatRequest(postRequest({ messages: [{ role: "user", content: "two" }] }), ENV)
+    const first = calls[0]!.init!.headers as Record<string, string>
+    const second = calls[1]!.init!.headers as Record<string, string>
+    expect(first["x-opencode-session"]).not.toBe(second["x-opencode-session"])
+    expect(first["x-opencode-request"]).not.toBe(second["x-opencode-request"])
+    // opencode session ids look like ses_<26 chars>, not bare UUIDs
+    expect(first["x-opencode-session"]).not.toMatch(/^[0-9a-f-]{36}$/)
+  })
+
   it("aggregates a non-streaming completion", async () => {
     mockFetch(
       sseResponse([

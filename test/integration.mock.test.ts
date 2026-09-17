@@ -245,25 +245,6 @@ describe("multi-turn integration", () => {
   })
 
   it("three-turn long conversation: multiple reasoning items replay in order; items stripped by the client are filtered", async () => {
-    // Turn N-1 upstream emits two reasoning items + tool call.
-    mockUpstream([
-      sseResponse([
-        {
-          type: "response.output_item.done",
-          item: { type: "reasoning", id: "rs_1", encrypted_content: "E1", summary: [{ type: "summary_text", text: "one" }] },
-        },
-        {
-          type: "response.output_item.done",
-          item: { type: "reasoning", id: "rs_2", encrypted_content: "E2", summary: [{ type: "summary_text", text: "two" }] },
-        },
-        {
-          type: "response.output_item.done",
-          item: { type: "function_call", call_id: "c1", name: "toolA", arguments: "{}" },
-        },
-        { type: "response.completed", response: {} },
-      ]),
-    ])
-
     // The agent strips reasoning_details from the FIRST assistant message
     // (some clients drop unknown fields) but preserves the second one.
     const preservedDetails = encodeReasoningDetails([
@@ -301,7 +282,7 @@ describe("multi-turn integration", () => {
       ENV,
     )
 
-    const body = JSON.parse(String(calls[1]!.init!.body)) as { input: Array<Record<string, unknown>> }
+    const body = JSON.parse(String(calls[0]!.init!.body)) as { input: Array<Record<string, unknown>> }
     const reasoningItems = body.input.filter((item) => item.type === "reasoning")
 
     // The stripped item must NOT be replayed (no encrypted_content -> dropped,
