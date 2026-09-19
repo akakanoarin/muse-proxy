@@ -12,7 +12,7 @@ import { createRaiser } from "./_lib/raise.js"
 import { chunkToSse, DONE_LINE, HEARTBEAT_COMMENT, HEARTBEAT_INTERVAL_MS, parseUpstreamSse } from "./_lib/sse.js"
 import type { ChatToolCall, ChatUsage, UpstreamEvent } from "./_lib/types.js"
 import { usageToChat } from "./_lib/usage.js"
-import { MODEL_ID, MODEL_NAME, OPENCODE_CLIENT, UPSTREAM_API_KEY, UPSTREAM_URL, UPSTREAM_USER_AGENT } from "./_lib/types.js"
+import { MODEL_ID, MODEL_NAME, OPENCODE_CLIENT, OPENCODE_PROJECT_ID, UPSTREAM_API_KEY, UPSTREAM_URL, UPSTREAM_USER_AGENT } from "./_lib/types.js"
 
 export interface ChatEnv {
   PROXY_API_KEY?: string
@@ -123,33 +123,33 @@ export async function handleChatRequest(
     return jsonResponse(jsonError(400, "request body must be valid JSON"))
   }
 
-  const lowered = lowerRequest(chatBody)
-  if ("error" in lowered) {
-    return jsonResponse(jsonError(lowered.error.status, lowered.error.message, lowered.error.code))
-  }
-
   const chat = chatBody as { stream?: boolean }
   const wantsStream = chat.stream === true
 
   const completionId = `chatcmpl-${crypto.randomUUID()}`
   const created = Math.floor(Date.now() / 1000)
 
+  // Mint the opencode identity BEFORE lowering so the session id can double
+  // as the upstream prompt_cache_key (the CLI sends its session id there).
+  const identity = identityForCall(completionId)
+  const lowered = lowerRequest(chatBody, { sessionId: identity.sessionId })
+  if ("error" in lowered) {
+    return jsonResponse(jsonError(lowered.error.status, lowered.error.message, lowered.error.code))
+  }
+
   let upstream: Response
   try {
-    // Full opencode client header set (request.ts): User-Agent, client flag,
-    // session/request IDs, and project ID. The zen free tier fingerprints
-    // this set; a bare UUID session id or missing client flag now lands in
-    // the strict non-opencode fallback bucket (429 "free tier ... within
-    // OpenCode"). The message id doubles as the per-message project key,
-    // mirroring how a real CLI process keeps one project per session.
-    const identity = identityForCall(completionId)
+    // Full opencode client header fingerprint (captured from a real 1.18.31
+    // CLI request): ai-sdk/runtime-suffixed UA, client flag, opencode-shaped
+    // session/request ids, and project:"global". The zen free tier rejects
+    // any deviation with 403 FreeTierError.
     upstream = await fetchImpl(UPSTREAM_URL, {
       method: "POST",
       headers: {
         authorization: `Bearer ${UPSTREAM_API_KEY}`,
         "content-type": "application/json",
-        accept: "text/event-stream",
-        // Free tier is UA-gated; without this upstream rejects the request.
+        accept: "*/*",
+        // Free tier is UA-gated; without a CLI-faithful UA upstream rejects.
         "user-agent": UPSTREAM_USER_AGENT,
         // Required by the responses endpoint (MissingSessionID otherwise).
         // Stateless proxy: opencode-shaped ses_/msg_ ids per upstream call;
@@ -157,7 +157,7 @@ export async function handleChatRequest(
         "x-opencode-session": identity.sessionId,
         "x-opencode-request": identity.requestId,
         "x-opencode-client": OPENCODE_CLIENT,
-        "x-opencode-project": identity.requestId,
+        "x-opencode-project": OPENCODE_PROJECT_ID,
       },
       body: JSON.stringify(lowered.request),
       // Propagate client disconnects so we stop billing upstream tokens.

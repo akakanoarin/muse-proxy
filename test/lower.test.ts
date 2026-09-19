@@ -25,6 +25,8 @@ describe("lowerRequest: basic mapping", () => {
     expect(request.reasoning).toEqual({ effort: "high", summary: "auto" })
     expect(request.input).toEqual([{ role: "user", content: [{ type: "input_text", text: "hi" }] }])
     expect(request.stream).toBe(true)
+    expect(request.tools).toHaveLength(11)
+    expect(request.tool_choice).toBe("auto")
   })
 
   it("maps any requested model id to the free muse model", () => {
@@ -122,7 +124,7 @@ describe("lowerRequest: parameters", () => {
     expect(request.top_p).toBe(0.9)
   })
 
-  it("maps tools and tool_choice", () => {
+  it("always carries the opencode builtin tool set with client tools appended", () => {
     const request = ok(
       lowerRequest({
         messages: [],
@@ -130,10 +132,47 @@ describe("lowerRequest: parameters", () => {
         tool_choice: "auto",
       }),
     )
-    expect(request.tools).toEqual([
-      { type: "function", name: "echo", description: "echo it", parameters: { type: "object" } },
-    ])
+    // Builtins first (fingerprint), client tools after.
+    expect(request.tools?.at(-1)).toEqual({
+      type: "function",
+      name: "echo",
+      description: "echo it",
+      parameters: { type: "object" },
+    })
+    const names = request.tools!.map((t) => t.name)
+    for (const builtin of ["bash", "edit", "glob", "grep", "read", "skill", "task", "todowrite", "webfetch", "websearch", "write"]) {
+      expect(names).toContain(builtin)
+    }
+    expect(names.filter((n) => n === "echo")).toHaveLength(1)
+    // tool_choice is forced to auto (upstream supports nothing else).
     expect(request.tool_choice).toBe("auto")
+  })
+
+  it("stubs builtin tool descriptions so the model cannot call unexecutable CLI tools", () => {
+    const request = ok(lowerRequest({ messages: [] }))
+    expect(request.tools).toHaveLength(11)
+    for (const tool of request.tools!) {
+      expect(tool.description).toBe("Reserved opencode CLI tool. Not available in this session; never call it.")
+    }
+  })
+
+  it("ignores client tools that shadow builtin names (canonical stub wins)", () => {
+    const request = ok(
+      lowerRequest({
+        messages: [],
+        tools: [{ type: "function", function: { name: "bash", description: "client bash", parameters: { type: "object" } } }],
+      }),
+    )
+    const bash = request.tools!.filter((t) => t.name === "bash")
+    expect(bash).toHaveLength(1)
+    expect(bash[0]!.description).not.toBe("client bash")
+  })
+
+  it("sets prompt_cache_key to the session id when provided", () => {
+    const request = ok(lowerRequest({ messages: [] }, { sessionId: "ses_abc" }))
+    expect(request.prompt_cache_key).toBe("ses_abc")
+    const without = ok(lowerRequest({ messages: [] }))
+    expect(without.prompt_cache_key).toBeUndefined()
   })
 
   it("defaults tool parameters when missing", () => {
@@ -143,7 +182,8 @@ describe("lowerRequest: parameters", () => {
         tools: [{ type: "function", function: { name: "noargs" } }],
       }),
     )
-    expect(request.tools?.[0]?.parameters).toEqual({ type: "object", properties: {} })
+    const noargs = request.tools!.find((t) => t.name === "noargs")
+    expect(noargs!.parameters).toEqual({ type: "object", properties: {} })
   })
 })
 

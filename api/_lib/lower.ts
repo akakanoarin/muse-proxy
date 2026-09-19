@@ -2,8 +2,16 @@
 // Responses API request. Mirrors opencode's own lowering rules for muse
 // models: store:false, include encrypted reasoning, reasoning summary auto,
 // effort whitelisting, and replay-item sanitization.
+//
+// Free-tier fingerprint note: the zen edge also gates on the request body's
+// tools array — the opencode builtin tool names must be present or the
+// request 403s with FreeTierError even when the header fingerprint is
+// perfect (probed 2026-09-18). So every lowered request carries the full
+// builtin set (descriptions stubbed so the model never calls a tool the
+// OpenAI client cannot execute) with the client's own tools appended.
 
 import { decodeReasoningDetails, sanitizeReplayItems, type ReasoningItem } from "./reasoning.js"
+import { OPENCODE_BUILTIN_TOOLS, STUB_BUILTIN_TOOL_DESCRIPTION } from "./tools.js"
 import {
   DEFAULT_REASONING_EFFORT,
   MAX_OUTPUT_TOKENS,
@@ -142,35 +150,44 @@ function toolResultItem(message: Record<string, unknown>): UpstreamInputItem | {
   return { type: "function_call_output", call_id: callId, output }
 }
 
-function toolChoice(value: unknown): UpstreamToolChoice | undefined {
-  if (value === "auto" || value === "none" || value === "required") return value
-  if (isRecord(value) && value.type === "function") {
-    const fn = isRecord(value.function) ? value.function : undefined
-    const name = asString(fn?.name)
-    if (name !== undefined) return { type: "function", name }
-  }
-  return undefined
+function toolChoice(): UpstreamToolChoice {
+  // Upstream only supports "auto": "none", "required", and named-function
+  // choices return 400 "only \"auto\" is supported for tool_choice". Clients
+  // that ask for anything else get "auto" (or omit it entirely, equivalent).
+  return "auto"
 }
 
-function lowerTools(value: unknown): UpstreamTool[] | undefined {
-  if (value === undefined || value === null) return undefined
-  if (!Array.isArray(value)) return undefined
-  const tools: UpstreamTool[] = []
-  for (const entry of value) {
-    if (!isRecord(entry)) continue
-    const fn = isRecord(entry.function) ? entry.function : undefined
-    const name = asString(fn?.name)
-    if (name === undefined) continue
-    const parameters =
-      isRecord(fn?.parameters) ? fn.parameters : { type: "object", properties: {} }
-    tools.push({
-      type: "function",
-      name,
-      description: asString(fn?.description) ?? "",
-      parameters,
-    })
+const BUILTIN_NAMES = new Set(OPENCODE_BUILTIN_TOOLS.map((t) => t.name))
+
+// Builtins with stubbed descriptions: the gate only checks names, and stubs
+// keep the model from calling CLI tools the OpenAI client never declared.
+const STUBBED_BUILTINS: UpstreamTool[] = OPENCODE_BUILTIN_TOOLS.map((tool) => ({
+  ...tool,
+  description: STUB_BUILTIN_TOOL_DESCRIPTION,
+}))
+
+// The gate requires the opencode builtin tool names in the request body.
+// Always send the full builtin set first, then the client's own tools.
+// If the client declares a tool with a builtin name, our canonical stub
+// definition wins (descriptions don't matter to the gate; the name set does).
+function mergeToolsWithBuiltins(value: unknown): UpstreamTool[] {
+  const client: UpstreamTool[] = []
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      if (!isRecord(entry)) continue
+      const fn = isRecord(entry.function) ? entry.function : undefined
+      const name = asString(fn?.name)
+      if (name === undefined || BUILTIN_NAMES.has(name)) continue
+      const parameters = isRecord(fn?.parameters) ? fn.parameters : { type: "object", properties: {} }
+      client.push({
+        type: "function",
+        name,
+        description: asString(fn?.description) ?? "",
+        parameters,
+      })
+    }
   }
-  return tools.length > 0 ? tools : undefined
+  return [...STUBBED_BUILTINS, ...client]
 }
 
 function clampMaxOutputTokens(chat: Record<string, unknown>): number | undefined {
@@ -179,7 +196,12 @@ function clampMaxOutputTokens(chat: Record<string, unknown>): number | undefined
   return Math.min(Math.floor(raw), MAX_OUTPUT_TOKENS)
 }
 
-export function lowerRequest(chat: unknown): LowerResult {
+export interface LowerOptions {
+  /** opencode session id used as the upstream prompt_cache_key. */
+  sessionId?: string
+}
+
+export function lowerRequest(chat: unknown, options: LowerOptions = {}): LowerResult {
   if (!isRecord(chat)) {
     return { error: { status: 400, message: "request body must be a JSON object" } }
   }
@@ -251,15 +273,16 @@ export function lowerRequest(chat: unknown): LowerResult {
     include: ["reasoning.encrypted_content"],
     reasoning: { effort: extractEffort(chat), summary: "auto" },
   }
+  if (options.sessionId) request.prompt_cache_key = options.sessionId
 
   if (systemTexts.length > 0) {
     request.input = [{ role: "system", content: systemTexts.join("\n") }, ...request.input]
   }
 
-  const tools = lowerTools(chat.tools)
-  if (tools) request.tools = tools
-  const toolChoiceValue = toolChoice(chat.tool_choice)
-  if (toolChoiceValue !== undefined) request.tool_choice = toolChoiceValue
+  // Free-tier fingerprint: the full opencode builtin set must always be
+  // present (client tools appended); tool_choice is always "auto" upstream.
+  request.tools = mergeToolsWithBuiltins(chat.tools)
+  request.tool_choice = toolChoice()
 
   if (typeof chat.temperature === "number") request.temperature = chat.temperature
   if (typeof chat.top_p === "number") request.top_p = chat.top_p

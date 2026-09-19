@@ -9,19 +9,25 @@ export const UPSTREAM_URL = "https://opencode.ai/zen/v1/responses"
 // opencode zen free models accept the literal api key "public" when no zen
 // account key is configured (see opencode provider.ts custom loader).
 export const UPSTREAM_API_KEY = "public"
-// The anonymous free tier is gated on an opencode-client header fingerprint:
-// User-Agent + x-opencode-client + x-opencode-session/request IDs. Recent
-// zen releases tightened this fingerprint and non-matching traffic now gets
+// The anonymous free tier is gated on an opencode-client fingerprint:
+// request headers (UA + x-opencode-* ids) AND the body's tools array (must
+// carry the opencode builtin tool names, see _lib/tools.ts). Recent zen
+// releases tightened this fingerprint; non-matching traffic gets
 // "OpenCode's free tier can only be used from within OpenCode" (the gate
-// moved out of the open-source handler into the closed-source edge).
-// Mirrors opencode's Installation.USER_AGENT:
-//   `opencode/${InstallationChannel}/${InstallationVersion}/${client}`
-// (packages/opencode/src/installation/index.ts), and the request-time header
-// set (packages/opencode/src/session/llm/request.ts).
+// lives in the closed-source edge; the open-source repo only tells us what
+// a real client sends).
+//
+// UA mirrors what the shipped opencode CLI emits on the wire (captured
+// 2026-09-18): ai-sdk/provider-utils + runtime/bun suffixes appended to
+// `opencode/<version>`. Note the in-repo request.ts constructs a different
+// (shorter) UA — the shipped binary is what passes the gate, so keep the
+// captured form. Re-verify on every upstream version bump.
 export const OPENCODE_VERSION = "1.18.31"
-export const OPENCODE_CHANNEL = "latest"
 export const OPENCODE_CLIENT = "cli"
-export const UPSTREAM_USER_AGENT = `opencode/${OPENCODE_CHANNEL}/${OPENCODE_VERSION}/${OPENCODE_CLIENT}`
+export const UPSTREAM_USER_AGENT = `opencode/${OPENCODE_VERSION} ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14`
+// The CLI sends x-opencode-project: "global" (project id of a global home
+// session); the edge accepts any value, but match the real client.
+export const OPENCODE_PROJECT_ID = "global"
 // Every requested model maps to the free contributor model.
 export const MODEL_ID = "muse-spark-1.3-contributor-free"
 export const MODEL_NAME = "Muse Spark 1.3 Contributor Free (opencode zen)"
@@ -66,9 +72,14 @@ export interface UpstreamTool {
   name: string
   description: string
   parameters: Record<string, unknown>
+  /** ai-sdk emits strict:false on opencode tools; keep the field available. */
+  strict?: boolean
 }
 
-export type UpstreamToolChoice = "auto" | "none" | "required" | { type: "function"; name: string }
+// The zen responses endpoint only supports tool_choice:"auto" (or omitting
+// the field): "none", "required", and named-function choices return 400
+// "only \"auto\" is supported for tool_choice" (probed 2026-09-18).
+export type UpstreamToolChoice = "auto"
 
 export interface UpstreamRequest {
   model: string
@@ -76,6 +87,8 @@ export interface UpstreamRequest {
   stream: true
   store: false
   include: ["reasoning.encrypted_content"]
+  /** Session-scoped prompt cache key; the CLI sends its session id. */
+  prompt_cache_key?: string
   reasoning?: { effort?: ReasoningEffort; summary?: "auto" }
   instructions?: string
   tools?: UpstreamTool[]

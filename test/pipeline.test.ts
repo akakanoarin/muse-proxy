@@ -126,26 +126,77 @@ describe("handleChatRequest", () => {
       reasoning: { effort: string; summary: string }
       max_output_tokens: number
       stream: boolean
+      tools: Array<{ name: string }>
+      tool_choice: string
+      prompt_cache_key: string
     }
     expect(body.store).toBe(false)
     expect(body.include).toEqual(["reasoning.encrypted_content"])
     expect(body.reasoning).toEqual({ effort: "high", summary: "auto" })
     expect(body.max_output_tokens).toBe(1000)
     expect(body.stream).toBe(true)
+    // Free-tier body fingerprint: builtins always present, tool_choice auto,
+    // prompt_cache_key mirrors the session header.
+    expect(body.tools.map((t) => t.name)).toEqual([
+      "bash", "edit", "glob", "grep", "read", "skill", "task", "todowrite", "webfetch", "websearch", "write",
+    ])
+    expect(body.tool_choice).toBe("auto")
+    const headers = init.headers as Record<string, string>
+    expect(body.prompt_cache_key).toBe(headers["x-opencode-session"])
   })
 
   it("sends the full opencode client header fingerprint upstream", async () => {
     mockFetch(sseResponse([{ type: "response.completed", response: {} }]))
     await handleChatRequest(postRequest({ messages: [{ role: "user", content: "hi" }] }), ENV)
     const headers = calls[0]!.init!.headers as Record<string, string>
-    // Mirrors opencode Installation.USER_AGENT + request.ts header set.
-    expect(headers["user-agent"]).toBe("opencode/latest/1.18.31/cli")
+    // Mirrors the shipped 1.18.31 CLI wire format (captured 2026-09-18):
+    // ai-sdk/provider-utils + runtime/bun suffixes, NOT the in-repo
+    // request.ts construction.
+    expect(headers["user-agent"]).toBe("opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14")
     expect(headers["x-opencode-client"]).toBe("cli")
     expect(headers["x-opencode-session"]).toMatch(/^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
     expect(headers["x-opencode-request"]).toMatch(/^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
-    expect(headers["x-opencode-project"]).toBeTruthy()
+    expect(headers["x-opencode-project"]).toBe("global")
     // Session and message ids differ per upstream call.
     expect(headers["x-opencode-session"]).not.toBe(headers["x-opencode-request"])
+  })
+
+  it("appends client tools after the builtin set and stubs builtin descriptions", async () => {
+    mockFetch(sseResponse([{ type: "response.completed", response: {} }]))
+    await handleChatRequest(
+      postRequest({
+        messages: [{ role: "user", content: "hi" }],
+        tools: [
+          { type: "function", function: { name: "web_search", description: "Search the web.", parameters: { type: "object" } } },
+          // A client tool shadowing a builtin name: canonical stub wins.
+          { type: "function", function: { name: "bash", description: "client bash", parameters: { type: "object" } } },
+        ],
+      }),
+      ENV,
+    )
+    const body = JSON.parse(String(calls[0]!.init!.body)) as {
+      tools: Array<{ name: string; description: string }>
+    }
+    const names = body.tools.map((t) => t.name)
+    expect(names.slice(0, 11)).toEqual(["bash", "edit", "glob", "grep", "read", "skill", "task", "todowrite", "webfetch", "websearch", "write"])
+    expect(names).toContain("web_search")
+    expect(names.filter((n) => n === "bash")).toHaveLength(1)
+    // builtin descriptions are stubbed; client tools keep their own
+    expect(body.tools[0]!.description).not.toBe("client bash")
+    expect(body.tools.find((t) => t.name === "web_search")!.description).toBe("Search the web.")
+  })
+
+  it("forces tool_choice to auto regardless of what the client asks for", async () => {
+    for (const tool_choice of ["none", "required", { type: "function", name: "web_search" }]) {
+      // A consumed SSE Response body is locked; mint a fresh one per call.
+      mockFetch(sseResponse([{ type: "response.completed", response: {} }]))
+      await handleChatRequest(
+        postRequest({ messages: [{ role: "user", content: "hi" }], tool_choice }),
+        ENV,
+      )
+      const body = JSON.parse(String(calls.at(-1)!.init!.body)) as { tool_choice: string }
+      expect(body.tool_choice).toBe("auto")
+    }
   })
 
   it("mints fresh opencode ids per upstream call", async () => {
