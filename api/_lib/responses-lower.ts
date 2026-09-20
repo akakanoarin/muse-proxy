@@ -127,24 +127,13 @@ function systemContentToText(content: unknown): string | undefined {
   return undefined
 }
 
-// Encrypted-reasoning replay items: with store:false upstream 400s on items
-// without encrypted_content (see reasoning.ts), so items missing it are
-// dropped, mirroring opencode's own store:false filter. Everything else is
-// passed through verbatim — the inbound shape IS the upstream shape.
-function reasoningReplayItem(item: Record<string, unknown>): UpstreamInputItem | undefined {
-  const id = asString(item.id)
-  const encryptedContent = asString(item.encrypted_content)
-  if (id === undefined || id.length === 0) return undefined
-  if (encryptedContent === undefined || encryptedContent.length === 0) return undefined
-  const summary: Array<{ type: "summary_text"; text: string }> = []
-  if (Array.isArray(item.summary)) {
-    for (const part of item.summary) {
-      if (isRecord(part) && part.type === "summary_text" && typeof part.text === "string") {
-        summary.push({ type: "summary_text", text: part.text })
-      }
-    }
-  }
-  return { type: "reasoning", id, summary, encrypted_content: encryptedContent }
+// Reasoning replay items are ALWAYS dropped on input: encrypted_content is
+// issued per upstream session, but this proxy mints a fresh opencode
+// session id per request, so any replayed blob belongs to a different
+// caller and upstream rejects it with "encrypted_content was not issued
+// to this caller". Dropping keeps multi-turn working via plain text.
+function reasoningReplayItem(_item: Record<string, unknown>): UpstreamInputItem | undefined {
+  return undefined
 }
 
 function functionCallItem(item: Record<string, unknown>): UpstreamInputItem | { error: true } {

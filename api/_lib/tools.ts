@@ -241,11 +241,13 @@ export const STUBBED_BUILTIN_TOOLS: UpstreamTool[] = OPENCODE_BUILTIN_TOOLS.map(
 
 const BUILTIN_NAMES = new Set(OPENCODE_BUILTIN_TOOLS.map((tool) => tool.name))
 
-// The gate requires the opencode builtin tool names in the request body.
-// Always send the full builtin set first, then the client's own tools.
-// Client-declared tools shadowing a builtin name are dropped: the canonical
-// stub definition wins (same rule as the chat facade's lower.ts).
+// The gate only checks the builtin NAME set. Shadow rule: a client tool
+// whose name collides with a builtin REPLACES the stub entry in place, so
+// the model sees the client's real description/parameters while the name
+// set still passes the gate (same rule as the chat facade's lower.ts).
 export function appendClientTools(client: UpstreamTool[]): UpstreamTool[] {
-  const filtered = client.filter((tool) => !BUILTIN_NAMES.has(tool.name))
-  return [...STUBBED_BUILTIN_TOOLS, ...filtered]
+  const clientByName = new Map(client.map((tool) => [tool.name, tool]))
+  const replaced = STUBBED_BUILTIN_TOOLS.map((tool) => clientByName.get(tool.name) ?? tool)
+  const extra = client.filter((tool) => !BUILTIN_NAMES.has(tool.name))
+  return [...replaced, ...extra]
 }

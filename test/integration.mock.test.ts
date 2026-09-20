@@ -1,9 +1,10 @@
 // Integration tests over the full request pipeline with a mocked upstream.
-// These encode the muse-spark multi-turn contract:
+// Multi-turn contract (encrypted-reasoning replay is dropped: blobs are
+// session-bound and rejected upstream; turns continue via text + tool
+// round-trips):
 //   turn 1: upstream streams reasoning + function_call
 //   agent executes the tool, echoes the assistant message back verbatim
-//   turn 2: the proxy must replay encrypted reasoning items + function_call
-//           round-trip to upstream exactly as opencode itself would.
+//   turn 2: the proxy replays the function_call round-trip only.
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest"
 import { handleChatRequest, type ChatDependencies } from "../api/chat"
@@ -125,7 +126,7 @@ describe("multi-turn integration", () => {
     expect(last.usage?.total_tokens).toBe(18)
   })
 
-  it("two-turn tool loop: turn 2 replays encrypted reasoning + function_call round-trip", async () => {
+  it("two-turn tool loop: turn 2 replays the function_call round-trip without reasoning blobs", async () => {
     // ---- Turn 1: model decides to call the echo tool ----
     mockUpstream([
       sseResponse([
@@ -210,30 +211,18 @@ describe("multi-turn integration", () => {
       include: string[]
     }
 
-    // Order and shape must match opencode's own lowering: reasoning item,
-    // function_call, then function_call_output.
+    // Encrypted-reasoning replay is dropped (session-bound blobs are rejected
+    // upstream); only the function_call round-trip is replayed.
     const types = turn2RequestBody.input.map((item) => ("role" in item ? item.role : item.type))
-    expect(types).toEqual(["user", "reasoning", "function_call", "function_call_output"])
+    expect(types).toEqual(["user", "function_call", "function_call_output"])
 
-    const reasoningItem = turn2RequestBody.input[1] as {
-      type: string
-      id: string
-      summary: Array<{ type: string; text: string }>
-      encrypted_content: string
-    }
-    expect(reasoningItem).toEqual({
-      type: "reasoning",
-      id: "rs_t1",
-      summary: [{ type: "summary_text", text: "need the echo tool" }],
-      encrypted_content: "ENC-T1",
-    })
-    expect(turn2RequestBody.input[2]).toEqual({
+    expect(turn2RequestBody.input[1]).toEqual({
       type: "function_call",
       call_id: "call_1",
       name: "echo",
       arguments: "{\"text\":\"hi\"}",
     })
-    expect(turn2RequestBody.input[3]).toEqual({
+    expect(turn2RequestBody.input[2]).toEqual({
       type: "function_call_output",
       call_id: "call_1",
       output: "echoed: hi",
@@ -244,7 +233,7 @@ describe("multi-turn integration", () => {
     expect(turn2RequestBody.include).toEqual(["reasoning.encrypted_content"])
   })
 
-  it("three-turn long conversation: multiple reasoning items replay in order; items stripped by the client are filtered", async () => {
+  it("three-turn long conversation: reasoning blobs dropped; tool round-trips replayed", async () => {
     // The agent strips reasoning_details from the FIRST assistant message
     // (some clients drop unknown fields) but preserves the second one.
     const preservedDetails = encodeReasoningDetails([
@@ -285,16 +274,9 @@ describe("multi-turn integration", () => {
     const body = JSON.parse(String(calls[0]!.init!.body)) as { input: Array<Record<string, unknown>> }
     const reasoningItems = body.input.filter((item) => item.type === "reasoning")
 
-    // The stripped item must NOT be replayed (no encrypted_content -> dropped,
-    // mirroring opencode's store:false filter). Only rs_3 survives.
-    expect(reasoningItems).toEqual([
-      {
-        type: "reasoning",
-        id: "rs_3",
-        summary: [{ type: "summary_text", text: "three" }],
-        encrypted_content: "E3",
-      },
-    ])
+    // Encrypted-reasoning replay is dropped entirely (session-bound blobs
+    // are rejected upstream); multi-turn continues via text + tool history.
+    expect(reasoningItems).toEqual([])
 
     // The function_call round-trip from turn 1 is still replayed.
     expect(body.input).toContainEqual({ type: "function_call", call_id: "c1", name: "toolA", arguments: "{}" })

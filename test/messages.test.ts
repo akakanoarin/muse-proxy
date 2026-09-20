@@ -172,7 +172,7 @@ describe("lowerMessagesRequest", () => {
     const weather = result.request.tools!.find((tool) => tool.name === "get_weather")!
     expect(weather.parameters).toEqual({ type: "object", properties: { city: { type: "string" } }, required: ["city"] })
     const bash = result.request.tools!.find((tool) => tool.name === "bash")!
-    expect(bash.description).toBe(STUB_BUILTIN_TOOL_DESCRIPTION)
+    expect(bash.description).toBe("shadow attempt")
   })
 
   it("maps thinking budget_tokens to the effort whitelist", () => {

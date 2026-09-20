@@ -93,7 +93,7 @@ describe("normalizeResponsesRequest", () => {
     ])
   })
 
-  it("drops reasoning items without encrypted_content (store:false contract) and keeps valid ones", () => {
+  it("drops all reasoning replay items (session-bound blobs rejected upstream)", () => {
     const result = normalizeResponsesRequest({
       input: [
         { type: "reasoning", id: "rs_bad" },
@@ -101,9 +101,7 @@ describe("normalizeResponsesRequest", () => {
       ],
     })
     if ("error" in result) throw new Error("unexpected error")
-    expect(result.request.input).toEqual([
-      { type: "reasoning", id: "rs_ok", summary: [{ type: "summary_text", text: "thought" }], encrypted_content: "ENC" },
-    ])
+    expect(result.request.input).toEqual([])
   })
 
   it("rejects item_reference (stateless proxy) and unsupported items", () => {
@@ -129,7 +127,7 @@ describe("normalizeResponsesRequest", () => {
         { type: "function", name: "my_tool", description: "mine", parameters: { type: "object", properties: {} } },
         // chat-nested shape tolerated
         { type: "function", function: { name: "nested", description: "nested tool", parameters: { type: "object" } } },
-        // builtin name from the client must NOT override the canonical stub
+        // builtin name from the client replaces the stub entry in place
         { type: "function", name: "bash", description: "client fake bash", parameters: {} },
       ],
     })
@@ -138,7 +136,11 @@ describe("normalizeResponsesRequest", () => {
     expect(tools).toHaveLength(OPENCODE_BUILTIN_TOOLS.length + 2)
     for (const builtin of OPENCODE_BUILTIN_TOOLS) {
       const sent = tools.find((t) => t.name === builtin.name)!
-      expect(sent.description).toBe(STUB_BUILTIN_TOOL_DESCRIPTION)
+      if (builtin.name === "bash") {
+        expect(sent.description).toBe("client fake bash")
+      } else {
+        expect(sent.description).toBe(STUB_BUILTIN_TOOL_DESCRIPTION)
+      }
     }
     expect(tools.at(-2)).toEqual({ type: "function", name: "my_tool", description: "mine", parameters: { type: "object", properties: {} } })
     expect(tools.at(-1)!.name).toBe("nested")
@@ -417,7 +419,7 @@ describe("responses endpoint integration", () => {
     expect(calls).toHaveLength(0)
   })
 
-  it("propagates multi-turn encrypted reasoning replay from input to the upstream body", async () => {
+  it("drops multi-turn encrypted reasoning replay instead of sending it upstream", async () => {
     mockUpstream([sseResponse([{ type: "response.completed", response: {} }])])
     await handleResponsesRequest(
       post({
@@ -432,12 +434,6 @@ describe("responses endpoint integration", () => {
     )
     const body = JSON.parse(String(calls[0]!.init!.body)) as { input: Array<Record<string, unknown>> }
     const types = body.input.map((item) => ("role" in item ? item.role : item.type))
-    expect(types).toEqual(["user", "reasoning", "function_call", "function_call_output"])
-    expect(body.input[1]).toEqual({
-      type: "reasoning",
-      id: "rs_1",
-      summary: [{ type: "summary_text", text: "thought" }],
-      encrypted_content: "ENC-1",
-    })
+    expect(types).toEqual(["user", "function_call", "function_call_output"])
   })
 })

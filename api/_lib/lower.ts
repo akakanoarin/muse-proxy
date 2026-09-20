@@ -1,7 +1,7 @@
 // Lower an OpenAI Chat Completions request body into an opencode zen
 // Responses API request. Mirrors opencode's own lowering rules for muse
 // models: store:false, include encrypted reasoning, reasoning summary auto,
-// effort whitelisting, and replay-item sanitization.
+// effort whitelisting (encrypted-reasoning replay is dropped: blobs are session-bound).
 //
 // Free-tier fingerprint note: the zen edge also gates on the request body's
 // tools array — the opencode builtin tool names must be present or the
@@ -10,7 +10,6 @@
 // builtin set (descriptions stubbed so the model never calls a tool the
 // OpenAI client cannot execute) with the client's own tools appended.
 
-import { decodeReasoningDetails, sanitizeReplayItems, type ReasoningItem } from "./reasoning.js"
 import { OPENCODE_BUILTIN_TOOLS, STUB_BUILTIN_TOOL_DESCRIPTION } from "./tools.js"
 import {
   DEFAULT_REASONING_EFFORT,
@@ -96,22 +95,6 @@ function userContentParts(content: unknown): UpstreamInputItem[] | { error: true
 // gateways with their own format). We can't interpret those safely, so we
 // ignore them — reasoning continuity then degrades gracefully instead of
 // failing the request upstream.
-function replayItemsFromAssistant(message: Record<string, unknown>): ReasoningItem[] {
-  const raw = message.reasoning_details
-  if (typeof raw !== "string") return []
-  return sanitizeReplayItems(decodeReasoningDetails(raw))
-}
-
-function reasoningInputItems(items: ReasoningItem[]): UpstreamInputItem[] {
-  return items.map((item) => ({
-    type: "reasoning" as const,
-    id: item.id,
-    summary:
-      item.summary.length > 0 ? [{ type: "summary_text" as const, text: item.summary }] : [],
-    encrypted_content: item.encrypted_content,
-  }))
-}
-
 function toolCallItems(message: Record<string, unknown>): UpstreamInputItem[] | { error: true } {
   const calls = message.tool_calls
   if (calls === undefined || calls === null) return []
@@ -166,20 +149,20 @@ const STUBBED_BUILTINS: UpstreamTool[] = OPENCODE_BUILTIN_TOOLS.map((tool) => ({
   description: STUB_BUILTIN_TOOL_DESCRIPTION,
 }))
 
-// The gate requires the opencode builtin tool names in the request body.
-// Always send the full builtin set first, then the client's own tools.
-// If the client declares a tool with a builtin name, our canonical stub
-// definition wins (descriptions don't matter to the gate; the name set does).
+// The gate only checks the builtin NAME set. Shadow rule: a client tool
+// whose name collides with a builtin REPLACES the stub entry in place, so
+// the model sees the client's real description/parameters while the name
+// set still passes the gate.
 function mergeToolsWithBuiltins(value: unknown): UpstreamTool[] {
-  const client: UpstreamTool[] = []
+  const clientByName = new Map<string, UpstreamTool>()
   if (Array.isArray(value)) {
     for (const entry of value) {
       if (!isRecord(entry)) continue
       const fn = isRecord(entry.function) ? entry.function : undefined
       const name = asString(fn?.name)
-      if (name === undefined || BUILTIN_NAMES.has(name)) continue
+      if (name === undefined) continue
       const parameters = isRecord(fn?.parameters) ? fn.parameters : { type: "object", properties: {} }
-      client.push({
+      clientByName.set(name, {
         type: "function",
         name,
         description: asString(fn?.description) ?? "",
@@ -187,7 +170,9 @@ function mergeToolsWithBuiltins(value: unknown): UpstreamTool[] {
       })
     }
   }
-  return [...STUBBED_BUILTINS, ...client]
+  return STUBBED_BUILTINS.map((tool) => clientByName.get(tool.name) ?? tool).concat(
+    [...clientByName.values()].filter((tool) => !BUILTIN_NAMES.has(tool.name)),
+  )
 }
 
 function clampMaxOutputTokens(chat: Record<string, unknown>): number | undefined {
@@ -240,7 +225,8 @@ export function lowerRequest(chat: unknown, options: LowerOptions = {}): LowerRe
     }
 
     if (role === "assistant") {
-      input.push(...reasoningInputItems(replayItemsFromAssistant(entry)))
+      // Encrypted-reasoning replay dropped (blobs are session-bound, and
+      // this proxy mints a fresh session per request): continue via text.
       const text = typeof entry.content === "string" ? entry.content : undefined
       if (text !== undefined && text.length > 0) {
         input.push({ role: "assistant", content: [{ type: "output_text", text }] })

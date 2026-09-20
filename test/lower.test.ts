@@ -156,7 +156,7 @@ describe("lowerRequest: parameters", () => {
     }
   })
 
-  it("ignores client tools that shadow builtin names (canonical stub wins)", () => {
+  it("lets client tools shadowing builtin names replace the stub entry in place", () => {
     const request = ok(
       lowerRequest({
         messages: [],
@@ -165,7 +165,9 @@ describe("lowerRequest: parameters", () => {
     )
     const bash = request.tools!.filter((t) => t.name === "bash")
     expect(bash).toHaveLength(1)
-    expect(bash[0]!.description).not.toBe("client bash")
+    expect(bash[0]!.description).toBe("client bash")
+    // Name set still carries the full builtin set, so the gate still passes.
+    expect(request.tools).toHaveLength(11)
   })
 
   it("sets prompt_cache_key to the session id when provided", () => {
@@ -194,7 +196,7 @@ describe("lowerRequest: encrypted reasoning replay", () => {
     encrypted_content: enc,
   })
 
-  it("decodes reasoning_details and places reasoning items before assistant text", () => {
+  it("drops reasoning_details replay (session-bound blobs rejected upstream)", () => {
     const details = encodeReasoningDetails([item("rs_1", "enc-1", "hmm")])
     const request = ok(
       lowerRequest({
@@ -211,7 +213,6 @@ describe("lowerRequest: encrypted reasoning replay", () => {
     )
     expect(request.input).toEqual([
       { role: "user", content: [{ type: "input_text", text: "q" }] },
-      { type: "reasoning", id: "rs_1", summary: [{ type: "summary_text", text: "hmm" }], encrypted_content: "enc-1" },
       { role: "assistant", content: [{ type: "output_text", text: "answer" }] },
       { role: "user", content: [{ type: "input_text", text: "follow-up" }] },
     ])
@@ -233,7 +234,7 @@ describe("lowerRequest: encrypted reasoning replay", () => {
     ])
   })
 
-  it("merges same-id fragments and drops broken payloads", () => {
+  it("drops same-id fragments instead of merging (no replay upstream)", () => {
     const details = encodeReasoningDetails([
       item("rs_1", "enc-old", "first"),
       item("rs_1", "enc-new", "second"),
@@ -247,14 +248,6 @@ describe("lowerRequest: encrypted reasoning replay", () => {
       }),
     )
     expect(request.input).toEqual([
-      {
-        type: "reasoning",
-        id: "rs_1",
-        // same-id fragments merge into one summary entry (matches opencode's
-        // single-part replay shape); encrypted_content keeps the latest value
-        summary: [{ type: "summary_text", text: "first\nsecond" }],
-        encrypted_content: "enc-new",
-      },
       { role: "assistant", content: [{ type: "output_text", text: "a" }] },
       { role: "user", content: [{ type: "input_text", text: "next" }] },
     ])

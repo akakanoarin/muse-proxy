@@ -168,7 +168,7 @@ describe("handleChatRequest", () => {
         messages: [{ role: "user", content: "hi" }],
         tools: [
           { type: "function", function: { name: "web_search", description: "Search the web.", parameters: { type: "object" } } },
-          // A client tool shadowing a builtin name: canonical stub wins.
+          // A client tool shadowing a builtin name replaces the stub entry in place.
           { type: "function", function: { name: "bash", description: "client bash", parameters: { type: "object" } } },
         ],
       }),
@@ -182,7 +182,7 @@ describe("handleChatRequest", () => {
     expect(names).toContain("web_search")
     expect(names.filter((n) => n === "bash")).toHaveLength(1)
     // builtin descriptions are stubbed; client tools keep their own
-    expect(body.tools[0]!.description).not.toBe("client bash")
+    expect(body.tools[0]!.description).toBe("client bash")
     expect(body.tools.find((t) => t.name === "web_search")!.description).toBe("Search the web.")
   })
 
