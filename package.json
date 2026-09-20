@@ -6,6 +6,8 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "smoke": "bun run scripts/smoke.ts",
+    "smoke:responses": "bun run scripts/smoke-responses.ts",
+    "smoke:messages": "bun run scripts/smoke-messages.ts",
     "eval": "bun run scripts/agent-eval.ts"
   },
   "devDependencies": {

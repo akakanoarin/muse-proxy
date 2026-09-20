@@ -231,3 +231,21 @@ export const OPENCODE_BUILTIN_TOOLS: UpstreamTool[] = [
 // Client-declared tools keep their own real descriptions.
 export const STUB_BUILTIN_TOOL_DESCRIPTION =
   "Reserved opencode CLI tool. Not available in this session; never call it."
+
+// Builtins with stubbed descriptions (shared by the chat, responses, and
+// messages facades).
+export const STUBBED_BUILTIN_TOOLS: UpstreamTool[] = OPENCODE_BUILTIN_TOOLS.map((tool) => ({
+  ...tool,
+  description: STUB_BUILTIN_TOOL_DESCRIPTION,
+}))
+
+const BUILTIN_NAMES = new Set(OPENCODE_BUILTIN_TOOLS.map((tool) => tool.name))
+
+// The gate requires the opencode builtin tool names in the request body.
+// Always send the full builtin set first, then the client's own tools.
+// Client-declared tools shadowing a builtin name are dropped: the canonical
+// stub definition wins (same rule as the chat facade's lower.ts).
+export function appendClientTools(client: UpstreamTool[]): UpstreamTool[] {
+  const filtered = client.filter((tool) => !BUILTIN_NAMES.has(tool.name))
+  return [...STUBBED_BUILTIN_TOOLS, ...filtered]
+}

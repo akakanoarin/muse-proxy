@@ -2,10 +2,14 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "rewrites": [
     { "source": "/v1/chat/completions", "destination": "/api/chat" },
+    { "source": "/v1/responses", "destination": "/api/responses" },
+    { "source": "/v1/messages", "destination": "/api/messages" },
     { "source": "/v1/models", "destination": "/api/models" }
   ],
   "functions": {
     "api/chat.ts": { "maxDuration": 300 },
+    "api/responses.ts": { "maxDuration": 300 },
+    "api/messages.ts": { "maxDuration": 300 },
     "api/models.ts": { "maxDuration": 60 }
   }
 }

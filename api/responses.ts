@@ -1,0 +1,322 @@
+// POST /v1/responses (rewritten to /api/responses) — OpenAI Responses API
+// facade, independent from the chat completions facade in api/chat.ts.
+//
+// Pipeline: auth -> normalizeResponsesRequest (Responses body -> upstream
+// Responses body, re-applying the muse fingerprint rules) -> fetch opencode
+// zen -> SSE passthrough (stream:true) or aggregated `response` object
+// (stream:false).
+//
+// Because the upstream already speaks the Responses API, streaming forwards
+// upstream events verbatim (re-framed as `event:`/`data:` SSE records, with
+// non-spec `ping` keep-alives dropped and a synthetic error event if the
+// upstream EOFs without a terminal event) and non-streaming aggregates the
+// same events into a single response object.
+
+import { checkAuth } from "./_lib/auth.js"
+import { jsonError, upstreamErrorToOpenAI } from "./_lib/errors.js"
+import { identityForCall } from "./_lib/identity.js"
+import { normalizeResponsesRequest } from "./_lib/responses-lower.js"
+import { HEARTBEAT_COMMENT, HEARTBEAT_INTERVAL_MS, parseUpstreamSse } from "./_lib/sse.js"
+import type { UpstreamEvent, UpstreamUsage } from "./_lib/types.js"
+import { DEFAULT_REASONING_EFFORT, MODEL_ID, OPENCODE_CLIENT, OPENCODE_PROJECT_ID, UPSTREAM_API_KEY, UPSTREAM_URL, UPSTREAM_USER_AGENT } from "./_lib/types.js"
+
+export interface ResponsesEnv {
+  PROXY_API_KEY?: string
+}
+
+export interface ResponsesDependencies {
+  fetchImpl?: typeof fetch
+}
+
+type FetchFn = typeof fetch
+
+function jsonResponse(res: { status: number; body: unknown }): Response {
+  return new Response(JSON.stringify(res.body), {
+    status: res.status,
+    headers: { "content-type": "application/json" },
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Non-streaming aggregation: rebuild a Responses `response` object from the
+// upstream SSE event stream.
+// ---------------------------------------------------------------------------
+
+type OutputItem = Record<string, unknown>
+
+interface AggregatedUsage extends UpstreamUsage {}
+
+export class ResponseBuilder {
+  output: OutputItem[] = []
+  outputText = ""
+  status: "completed" | "incomplete" | "failed" = "completed"
+  incompleteDetails: { reason: string } | null = null
+  error: { code: string | null; message: string } | null = null
+  usage: AggregatedUsage | undefined
+  upstreamResponseId: string | undefined
+  /** True once a terminal event (completed/incomplete/failed/error) was seen. */
+  sawTerminalEvent = false
+
+  addEvent(raw: Record<string, unknown>) {
+    const event = raw as unknown as UpstreamEvent
+
+    if (
+      (event.type === "response.created" || event.type === "response.in_progress") &&
+      typeof event.response?.id === "string"
+    ) {
+      this.upstreamResponseId = event.response.id
+      return
+    }
+
+    if (event.type === "response.output_item.done" && event.item) {
+      const item = event.item as unknown as OutputItem
+      if (item.type === "message" && Array.isArray(item.content)) {
+        for (const part of item.content) {
+          const p = part as { type?: string; text?: string }
+          if ((p.type === "output_text" || p.type === "refusal") && typeof p.text === "string") {
+            this.outputText += p.text
+          }
+        }
+      }
+      this.output.push(item)
+      return
+    }
+
+    if (event.type === "response.completed") {
+      this.status = "completed"
+      this.sawTerminalEvent = true
+      if (event.response?.usage) this.usage = event.response.usage
+      return
+    }
+
+    if (event.type === "response.incomplete") {
+      this.status = "incomplete"
+      this.sawTerminalEvent = true
+      if (event.response?.usage) this.usage = event.response.usage
+      const reason = event.response?.incomplete_details?.reason
+      this.incompleteDetails = typeof reason === "string" ? { reason } : null
+      return
+    }
+
+    if (event.type === "response.failed" || event.type === "error") {
+      this.status = "failed"
+      this.sawTerminalEvent = true
+      const code = event.code ?? event.response?.error?.code ?? null
+      const message = event.message ?? event.response?.error?.message ?? "unknown upstream error"
+      this.error = { code: typeof code === "string" ? code : null, message }
+      return
+    }
+  }
+
+  build(fallbackId: string, createdAt: number, echo: Record<string, unknown>): Record<string, unknown> {
+    const body: Record<string, unknown> = {
+      id: this.upstreamResponseId ?? fallbackId,
+      object: "response",
+      created_at: createdAt,
+      status: this.status,
+      model: MODEL_ID,
+      output: this.output,
+      output_text: this.outputText,
+      error: this.error,
+      incomplete_details: this.incompleteDetails,
+      usage: this.usage ?? null,
+      parallel_tool_calls: true,
+      metadata: {},
+      store: false,
+      ...echo,
+    }
+    return body
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Handler
+// ---------------------------------------------------------------------------
+
+export async function handleResponsesRequest(
+  request: Request,
+  env: ResponsesEnv,
+  dependencies: ResponsesDependencies = {},
+): Promise<Response> {
+  const fetchImpl: FetchFn = dependencies.fetchImpl ?? fetch
+
+  if (!checkAuth(request, env)) {
+    return jsonResponse(jsonError(401, "invalid or missing proxy API key", "invalid_proxy_key", "authentication_error"))
+  }
+  if (request.method !== "POST") {
+    return jsonResponse(jsonError(405, "method not allowed", "method_not_allowed"))
+  }
+
+  let rawBody: unknown
+  try {
+    rawBody = await request.json()
+  } catch {
+    return jsonResponse(jsonError(400, "request body must be valid JSON"))
+  }
+
+  const responseId = `resp_${crypto.randomUUID()}`
+  const createdAt = Math.floor(Date.now() / 1000)
+
+  // Mint the opencode identity BEFORE normalizing so the session id can
+  // double as the upstream prompt_cache_key (same contract as api/chat.ts).
+  const identity = identityForCall(responseId)
+  const normalized = normalizeResponsesRequest(rawBody, { sessionId: identity.sessionId })
+  if ("error" in normalized) {
+    return jsonResponse(jsonError(normalized.error.status, normalized.error.message, normalized.error.code))
+  }
+  const wantsStream = normalized.stream
+
+  let upstream: Response
+  try {
+    // Identical opencode client header fingerprint as api/chat.ts — the zen
+    // free tier gates on it regardless of which facade the client used.
+    upstream = await fetchImpl(UPSTREAM_URL, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${UPSTREAM_API_KEY}`,
+        "content-type": "application/json",
+        accept: "*/*",
+        "user-agent": UPSTREAM_USER_AGENT,
+        "x-opencode-session": identity.sessionId,
+        "x-opencode-request": identity.requestId,
+        "x-opencode-client": OPENCODE_CLIENT,
+        "x-opencode-project": OPENCODE_PROJECT_ID,
+      },
+      body: JSON.stringify(normalized.request),
+      // Propagate client disconnects so we stop billing upstream tokens.
+      signal: request.signal,
+    })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "network error"
+    return jsonResponse(jsonError(502, `failed to reach opencode zen: ${message}`, "upstream_unreachable", "api_error"))
+  }
+
+  if (!upstream.ok || upstream.body === null) {
+    let upstreamJson: unknown = null
+    try {
+      upstreamJson = await upstream.json()
+    } catch {
+      upstreamJson = null
+    }
+    return jsonResponse(upstreamErrorToOpenAI(upstream.status, upstreamJson))
+  }
+
+  const events: AsyncGenerator<Record<string, unknown> | "done"> = parseUpstreamSse(upstream.body)
+
+  // ------------------------------------------------------------------
+  // Non-streaming: aggregate internally, respond with one JSON object.
+  // ------------------------------------------------------------------
+  if (!wantsStream) {
+    const builder = new ResponseBuilder()
+    for await (const event of events) {
+      if (event === "done") break
+      builder.addEvent(event)
+    }
+    if (builder.status === "failed") {
+      // Upstream surfaced a terminal failure: return it as an error body.
+      return jsonResponse(jsonError(502, builder.error?.message ?? "upstream error", builder.error?.code ?? "upstream_error", "api_error"))
+    }
+    if (!builder.sawTerminalEvent) {
+      // Upstream EOFed without any terminal event: the aggregated output is
+      // truncated, so never report it as a completed response.
+      return jsonResponse(jsonError(502, "upstream closed the stream before a terminal response event", "upstream_stream_truncated", "api_error"))
+    }
+    const echo: Record<string, unknown> = {
+      temperature: normalized.request.temperature ?? null,
+      top_p: normalized.request.top_p ?? null,
+      max_output_tokens: normalized.request.max_output_tokens ?? null,
+      tool_choice: "auto",
+      reasoning: { effort: normalized.request.reasoning?.effort ?? DEFAULT_REASONING_EFFORT, summary: "auto" },
+    }
+    return new Response(JSON.stringify(builder.build(responseId, createdAt, echo)), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    })
+  }
+
+  // ------------------------------------------------------------------
+  // Streaming: re-frame upstream events as canonical Responses SSE
+  // (`event: <type>` + `data: <json>`), verbatim payload passthrough.
+  // ------------------------------------------------------------------
+  const encoder = new TextEncoder()
+
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      let closed = false
+      const push = (text: string) => {
+        if (!closed) controller.enqueue(encoder.encode(text))
+      }
+
+      const heartbeat = setInterval(() => push(HEARTBEAT_COMMENT), HEARTBEAT_INTERVAL_MS)
+
+      const frameEvent = (event: Record<string, unknown>): string => {
+        const type = typeof event.type === "string" ? event.type : undefined
+        const data = `data: ${JSON.stringify(event)}\n\n`
+        return type !== undefined ? `event: ${type}\n${data}` : data
+      }
+
+      try {
+        let sawTerminalEvent = false
+        for await (const event of events) {
+          if (event === "done") break
+          // opencode zen interleaves `ping` keep-alive frames inside the
+          // event stream (including after response.completed). They are not
+          // part of the OpenAI Responses event contract and would otherwise
+          // break clients that expect response.completed to terminate the
+          // stream; the proxy's own heartbeat comments already keep the
+          // connection alive, so drop them here.
+          if (event.type === "ping") continue
+          if (
+            event.type === "response.completed" ||
+            event.type === "response.incomplete" ||
+            event.type === "response.failed" ||
+            event.type === "error"
+          ) {
+            sawTerminalEvent = true
+          }
+          push(frameEvent(event))
+        }
+        if (!sawTerminalEvent) {
+          // Upstream closed the connection without a terminal event (e.g. a
+          // mid-generation EOF). Never let the stream end silently: clients
+          // would treat truncated output as a complete response.
+          push(frameEvent({
+            type: "error",
+            code: "upstream_stream_truncated",
+            message: "upstream closed the stream before a terminal response event",
+          }))
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "stream interrupted"
+        push(frameEvent({ type: "error", code: "proxy_stream_error", message }))
+      } finally {
+        clearInterval(heartbeat)
+        if (!closed) {
+          closed = true
+          controller.close()
+        }
+      }
+    },
+    cancel() {
+      // Client disconnected; request.signal already aborts the upstream fetch.
+    },
+  })
+
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache, no-transform",
+      connection: "keep-alive",
+      "x-accel-buffering": "no",
+    },
+  })
+}
+
+// Vercel handler shell (Node.js runtime, Web-standard fetch export).
+async function handler(request: Request): Promise<Response> {
+  return handleResponsesRequest(request, { PROXY_API_KEY: process.env.PROXY_API_KEY })
+}
+
+export default { fetch: handler }
+export { handler as POST, handler as GET }
