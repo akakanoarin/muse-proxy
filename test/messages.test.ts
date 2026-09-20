@@ -49,6 +49,21 @@ describe("lowerMessagesRequest", () => {
     expect("error" in missing && missing.error.code === "missing_max_tokens").toBe(true)
   })
 
+  it("accepts role:system/developer messages inside the messages array (Claude Code compat)", () => {
+    const result = lowerMessagesRequest({
+      max_tokens: 64,
+      system: "top-level",
+      messages: [
+        { role: "system", content: "from-array" },
+        { role: "developer", content: [{ type: "text", text: "dev-note" }] },
+        { role: "user", content: "hi" },
+      ],
+    })
+    if ("error" in result) throw new Error("unexpected error")
+    expect(result.request.input[0]).toEqual({ role: "system", content: "top-level\nfrom-array\ndev-note" })
+    expect(result.request.input).toHaveLength(2)
+  })
+
   it("maps system string and text blocks to a leading system item", () => {
     const result = lowerMessagesRequest({
       max_tokens: 64,

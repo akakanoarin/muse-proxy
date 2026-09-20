@@ -4,7 +4,7 @@
 // responses facades must stay byte-for-byte untouched.
 //
 // Mappings:
-//   - system (string | text blocks)          -> first role:"system" item
+//   - system (top-level or role:"system"/"developer" in messages) -> first role:"system" item
 //   - user text block / string               -> input_text
 //   - user image block (base64/url source)   -> input_image (data URL / URL)
 //   - assistant text block / string          -> output_text
@@ -223,6 +223,10 @@ export function lowerMessagesRequest(body: unknown, options: LowerOptions = {}):
   if (system && typeof system === "object") {
     return { error: { status: 400, message: "system: unsupported content (string or text blocks only)" } }
   }
+  // Claude Code 会把系统提示以 role:"system" 的消息直接放进 messages 数组，
+  // 而 Anthropic 规范只允许顶层 system 参数，这里兼容收拢为首条上游 system。
+  const systemTexts: string[] = []
+  if (typeof system === "string" && system.length > 0) systemTexts.push(system)
 
   for (const entry of messages) {
     if (!isRecord(entry)) {
@@ -259,6 +263,15 @@ export function lowerMessagesRequest(body: unknown, options: LowerOptions = {}):
       return { error: { status: 400, message: "assistant message content must be a string or content blocks" } }
     }
 
+    if (role === "system" || role === "developer") {
+      const text = systemToText(content)
+      if (text && typeof text === "object") {
+        return { error: { status: 400, message: "system message content must be a string or text blocks" } }
+      }
+      if (typeof text === "string" && text.length > 0) systemTexts.push(text)
+      continue
+    }
+
     return { error: { status: 400, message: `unsupported message role: ${String(role)}` } }
   }
 
@@ -273,8 +286,8 @@ export function lowerMessagesRequest(body: unknown, options: LowerOptions = {}):
   }
   if (options.sessionId) request.prompt_cache_key = options.sessionId
 
-  if (typeof system === "string" && system.length > 0) {
-    request.input = [{ role: "system", content: system }, ...request.input]
+  if (systemTexts.length > 0) {
+    request.input = [{ role: "system", content: systemTexts.join("\n") }, ...request.input]
   }
 
   // Free-tier fingerprint: full opencode builtin set (stubbed) + client tools;
