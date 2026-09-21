@@ -419,6 +419,75 @@ describe("responses endpoint integration", () => {
     expect(calls).toHaveLength(0)
   })
 
+  it("non-streaming: drops hidden builtin function_call items but keeps client calls", async () => {
+    mockUpstream([
+      sseResponse([
+        {
+          type: "response.output_item.done",
+          item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "bash", arguments: '{"command":"x"}' },
+        },
+        {
+          type: "response.output_item.done",
+          item: { type: "function_call", id: "fc_2", call_id: "call_2", name: "websearch", arguments: '{"query":"x"}' },
+        },
+        {
+          type: "response.output_item.done",
+          item: { type: "function_call", id: "fc_3", call_id: "call_3", name: "get_weather", arguments: '{"city":"x"}' },
+        },
+        { type: "response.completed", response: { usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } } },
+      ]),
+    ])
+    const res = await handleResponsesRequest(post({ input: "hi" }), ENV)
+    const body = (await res.json()) as Record<string, unknown>
+    const output = body.output as Array<Record<string, unknown>>
+    expect(output.map((item) => item.name)).toEqual(["get_weather"])
+  })
+
+  it("streaming: drops the full hidden function_call event sequence but forwards client calls", async () => {
+    mockUpstream([
+      sseResponse([
+        { type: "response.created", response: { id: "resp_hidden" } },
+        {
+          type: "response.output_item.added",
+          output_index: 0,
+          item: { id: "fc_hidden", type: "function_call", status: "in_progress", name: "bash", call_id: "call_h", arguments: "" },
+        },
+        { type: "response.function_call_arguments.delta", output_index: 0, item_id: "fc_hidden", delta: '{"co' },
+        { type: "response.function_call_arguments.done", output_index: 0, item_id: "fc_hidden", arguments: '{"co"}', name: "bash" },
+        {
+          type: "response.output_item.done",
+          output_index: 0,
+          item: { id: "fc_hidden", type: "function_call", status: "completed", name: "bash", call_id: "call_h", arguments: '{"co"}' },
+        },
+        {
+          type: "response.output_item.added",
+          output_index: 1,
+          item: { id: "fc_client", type: "function_call", status: "in_progress", name: "get_weather", call_id: "call_c", arguments: "" },
+        },
+        { type: "response.function_call_arguments.delta", output_index: 1, item_id: "fc_client", delta: '{"ci' },
+        {
+          type: "response.output_item.done",
+          output_index: 1,
+          item: { id: "fc_client", type: "function_call", status: "completed", name: "get_weather", call_id: "call_c", arguments: '{"ci"}' },
+        },
+        { type: "response.completed", response: { usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } } },
+      ]),
+    ])
+    const res = await handleResponsesRequest(post({ input: "hi", stream: true }), ENV)
+    const text = await res.text()
+    expect(text).not.toContain('"bash"')
+    expect(text).not.toContain("fc_hidden")
+    expect(text).not.toContain('call_h')
+    expect(text).toContain('"get_weather"')
+    expect(text).toContain("fc_client")
+    const frames = text.split("\n\n").filter((block) => block.startsWith("event: "))
+    const types = frames.map((frame) => frame.split("\n")[0]!.slice("event: ".length))
+    // 隐藏调用的 delta 已丢弃：剩下唯一的 arguments.delta 属于客户端工具。
+    expect(types.filter((type) => type === "response.function_call_arguments.delta")).toHaveLength(1)
+    expect(text).toContain("fc_client")
+    expect(types.at(-1)).toBe("response.completed")
+  })
+
   it("drops multi-turn encrypted reasoning replay instead of sending it upstream", async () => {
     mockUpstream([sseResponse([{ type: "response.completed", response: {} }])])
     await handleResponsesRequest(

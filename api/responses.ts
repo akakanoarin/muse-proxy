@@ -264,6 +264,12 @@ export async function handleResponsesRequest(
       try {
         let sawTerminalEvent = false
         const clientToolNames = normalized.clientToolNames
+        // 隐藏内置工具调用的 item id 集合：output_item.added 里记下，
+        // 后续 arguments.delta/done 按 item_id 丢弃。必须全序列丢弃
+        // （added + delta + done + output_item.done）：只丢 done 会留下
+        // 有头无尾的 tool-call，客户端 SDK 在 response.completed 到达时
+        // 发现 pending arguments 未完成，直接报 stream protocol error。
+        const hiddenItemIds = new Set<string>()
         for await (const event of events) {
           if (event === "done") break
           // opencode zen interleaves `ping` keep-alive frames inside the
@@ -273,16 +279,41 @@ export async function handleResponsesRequest(
           // stream; the proxy's own heartbeat comments already keep the
           // connection alive, so drop them here.
           if (event.type === "ping") continue
+          if (event.type === "response.output_item.added") {
+            const item = event.item as Record<string, unknown> | undefined
+            if (item?.type === "function_call" && typeof item.name === "string" && !shouldExposeToolCall(item.name, clientToolNames)) {
+              if (typeof item.id === "string") hiddenItemIds.add(item.id)
+              continue
+            }
+          }
+          if (event.type === "response.function_call_arguments.delta" || event.type === "response.function_call_arguments.done") {
+            const itemId = typeof event.item_id === "string" ? event.item_id : undefined
+            const name = typeof event.name === "string" ? event.name : undefined
+            if ((itemId !== undefined && hiddenItemIds.has(itemId)) || (name !== undefined && !shouldExposeToolCall(name, clientToolNames))) {
+              continue
+            }
+          }
           if (event.type === "response.output_item.done") {
             const item = (event as Record<string, unknown>).item as Record<string, unknown> | undefined
-            if (item?.type === "function_call" && typeof item.name === "string" && !shouldExposeToolCall(item.name, clientToolNames)) continue
+            if (item?.type === "function_call" && typeof item.name === "string" && !shouldExposeToolCall(item.name, clientToolNames)) {
+              if (typeof item.id === "string") hiddenItemIds.delete(item.id)
+              continue
+            }
           }
-          if (
-            event.type === "response.completed" ||
-            event.type === "response.incomplete" ||
-            event.type === "response.failed" ||
-            event.type === "error"
-          ) {
+          if (event.type === "response.completed" || event.type === "response.incomplete") {
+            // 终端事件自带的 response.output 数组也可能含隐藏调用：剥离，
+            // 否则客户端解析 completed 时仍会看到无头尾的 tool-call。
+            const response = event.response as Record<string, unknown> | undefined
+            const output = response?.output
+            if (response && Array.isArray(output)) {
+              response.output = output.filter((entry) => {
+                if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return true
+                const record = entry as Record<string, unknown>
+                return !(record.type === "function_call" && typeof record.name === "string" && !shouldExposeToolCall(record.name, clientToolNames))
+              })
+            }
+            sawTerminalEvent = true
+          } else if (event.type === "response.failed" || event.type === "error") {
             sawTerminalEvent = true
           }
           push(frameEvent(event))
