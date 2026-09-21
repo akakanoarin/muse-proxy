@@ -241,6 +241,19 @@ export const STUBBED_BUILTIN_TOOLS: UpstreamTool[] = OPENCODE_BUILTIN_TOOLS.map(
 
 const BUILTIN_NAMES = new Set(OPENCODE_BUILTIN_TOOLS.map((tool) => tool.name))
 
+export const BUILTIN_TOOL_NAMES: ReadonlySet<string> = BUILTIN_NAMES
+
+export function isBuiltinToolName(name: string): boolean {
+  if (!name) return false
+  return BUILTIN_NAMES.has(name)
+}
+
+export function shouldExposeToolCall(name: string, clientToolNames: ReadonlySet<string>): boolean {
+  if (clientToolNames.has(name)) return true
+  if (BUILTIN_NAMES.has(name)) return false
+  return true
+}
+
 // The gate only checks the builtin NAME set. Shadow rule: a client tool
 // whose name collides with a builtin REPLACES the stub entry in place, so
 // the model sees the client's real description/parameters while the name

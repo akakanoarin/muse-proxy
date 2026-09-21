@@ -17,6 +17,7 @@ import { identityForCall } from "./_lib/identity.js"
 import { MessageRaiser, type AnthropicEvent } from "./_lib/messages-raise.js"
 import { lowerMessagesRequest } from "./_lib/messages-lower.js"
 import { HEARTBEAT_COMMENT, HEARTBEAT_INTERVAL_MS, parseUpstreamSse } from "./_lib/sse.js"
+import { shouldExposeToolCall } from "./_lib/tools.js"
 import type { UpstreamEvent, UpstreamUsage } from "./_lib/types.js"
 import { MODEL_ID, OPENCODE_CLIENT, OPENCODE_PROJECT_ID, UPSTREAM_API_KEY, UPSTREAM_URL, UPSTREAM_USER_AGENT } from "./_lib/types.js"
 
@@ -63,6 +64,15 @@ function upstreamErrorToAnthropic(status: number, upstreamBody: unknown): Respon
   return anthropicError(502, "api_error", `upstream rejected credentials (${status}): ${detail}`)
 }
 
+function isExposedMessagesTool(name: string, clientToolNames: ReadonlySet<string>, toolChoice: unknown): boolean {
+  if (toolChoice === "none") return false
+  if (typeof toolChoice === "object" && toolChoice !== null && !Array.isArray(toolChoice)) {
+    const record = toolChoice as Record<string, unknown>
+    if (record.type === "tool" && typeof record.name === "string") return name === record.name
+    if (record.type === "any" || record.type === "auto") return shouldExposeToolCall(name, clientToolNames)
+  }
+  return shouldExposeToolCall(name, clientToolNames)
+}
 // ---------------------------------------------------------------------------
 // Non-streaming aggregation: rebuild an Anthropic `message` object from the
 // upstream SSE event stream.
@@ -79,6 +89,8 @@ export class MessageBuilder {
   usage: UpstreamUsage = { input_tokens: 0, output_tokens: 0 }
   error: { code: string | null; message: string } | null = null
   sawTerminalEvent = false
+  clientToolNames: ReadonlySet<string> = new Set<string>()
+  toolChoice: unknown = undefined
 
   private appendToBlock(type: "text" | "thinking", delta: string): void {
     const last = this.content.at(-1)
@@ -113,14 +125,15 @@ export class MessageBuilder {
     }
     if (event.type === "response.output_item.done" && event.item?.type === "function_call") {
       const callId = event.item.call_id ?? event.item.id
-      if (callId && event.item.name) {
+      const name = event.item.name
+      if (callId && name && isExposedMessagesTool(name, this.clientToolNames, this.toolChoice)) {
         let input: Record<string, unknown>
         try {
           input = JSON.parse(event.item.arguments ?? "{}") as Record<string, unknown>
         } catch {
           input = { _unparsed: event.item.arguments ?? "" }
         }
-        this.content.push({ type: "tool_use", id: callId, name: event.item.name, input })
+        this.content.push({ type: "tool_use", id: callId, name, input })
       }
       return
     }
@@ -187,7 +200,9 @@ export async function handleMessagesRequest(
   }
 
   const messageId = `msg_${crypto.randomUUID()}`
-  const wantsStream = (rawBody as { stream?: boolean } | null)?.stream === true
+  const parsedBody = (rawBody as { stream?: boolean; tool_choice?: unknown } | null) ?? {}
+  const wantsStream = parsedBody.stream === true
+  const clientToolChoice = parsedBody.tool_choice
 
   // Mint the opencode identity BEFORE lowering so the session id can
   // double as the upstream prompt_cache_key (same contract as the other
@@ -240,6 +255,8 @@ export async function handleMessagesRequest(
   // ------------------------------------------------------------------
   if (!wantsStream) {
     const builder = new MessageBuilder()
+    builder.clientToolNames = lowered.clientToolNames
+    builder.toolChoice = clientToolChoice
     for await (const event of events) {
       if (event === "done") break
       builder.addEvent(event)
@@ -265,7 +282,7 @@ export async function handleMessagesRequest(
   // ends with message_stop, per the Anthropic contract).
   // ------------------------------------------------------------------
   const encoder = new TextEncoder()
-  const raiser = new MessageRaiser({ messageId, model: MODEL_ID })
+  const raiser = new MessageRaiser({ messageId, model: MODEL_ID, clientToolNames: lowered.clientToolNames, toolChoice: clientToolChoice })
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {

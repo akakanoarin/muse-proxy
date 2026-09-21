@@ -3,6 +3,7 @@
 // heartbeats, and non-stream aggregation.
 
 import { encodeReasoningDetails, type ReasoningItem } from "./reasoning.js"
+import { shouldExposeToolCall } from "./tools.js"
 import type { ChatChunk, ChatUsage, UpstreamEvent } from "./types.js"
 import { usageToChat } from "./usage.js"
 
@@ -10,6 +11,8 @@ export interface RaiserOptions {
   id: string
   created: number
   model: string
+  clientToolNames?: ReadonlySet<string>
+  toolChoice?: unknown
 }
 
 export interface Raiser {
@@ -25,6 +28,15 @@ interface RaiserState {
 
 const EMPTY_DELTA = {}
 
+function forcedToolName(choice: unknown): string | undefined {
+  if (typeof choice !== "object" || choice === null || Array.isArray(choice)) return undefined
+  const record = choice as Record<string, unknown>
+  if (record.type !== "function") return undefined
+  const fn = record.function
+  if (typeof fn !== "object" || fn === null || Array.isArray(fn)) return undefined
+  const name = (fn as Record<string, unknown>).name
+  return typeof name === "string" ? name : undefined
+}
 function chunk(
   options: RaiserOptions,
   delta: ChatChunk["choices"][number]["delta"],
@@ -44,7 +56,7 @@ function chunk(
 
 export function createRaiser(options: RaiserOptions): Raiser {
   const state: RaiserState = { toolCallCount: 0, sawToolCalls: false, finished: false }
-
+  const clientToolNames = options.clientToolNames ?? new Set<string>()
   const emitFinish = (finishReason: string, usage?: ChatUsage): ChatChunk[] => {
     if (state.finished) return []
     state.finished = true
@@ -76,6 +88,9 @@ export function createRaiser(options: RaiserOptions): Raiser {
     if (item.type === "function_call") {
       const callId = item.call_id ?? item.id
       if (!callId || !item.name) return []
+      if (options.toolChoice === "none") return []
+      const forced = forcedToolName(options.toolChoice)
+      if (forced !== undefined ? item.name !== forced : !shouldExposeToolCall(item.name, clientToolNames)) return []
       const index = state.toolCallCount++
       state.sawToolCalls = true
       return [

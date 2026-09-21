@@ -36,7 +36,7 @@ import {
 } from "./types.js"
 
 export type LowerResult =
-  | { request: UpstreamRequest }
+  | { request: UpstreamRequest; clientToolNames: Set<string> }
   | { error: { status: number; message: string; code?: string } }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -81,7 +81,8 @@ function systemToText(value: unknown): string | undefined | { error: true } {
   if (Array.isArray(value)) {
     const texts: string[] = []
     for (const part of value) {
-      if (!isRecord(part) || part.type !== "text" || typeof part.text !== "string") return { error: true }
+      if (!isRecord(part) || typeof part.text !== "string") return { error: true }
+      if (part.type !== undefined && part.type !== "text") return { error: true }
       texts.push(part.text)
     }
     return texts.join("\n")
@@ -292,11 +293,12 @@ export function lowerMessagesRequest(body: unknown, options: LowerOptions = {}):
 
   // Free-tier fingerprint: full opencode builtin set (stubbed) + client tools;
   // tool_choice is always "auto" upstream (same as the other facades).
-  request.tools = appendClientTools(clientTools(body.tools))
+  const client = clientTools(body.tools)
+  request.tools = appendClientTools(client)
   request.tool_choice = "auto"
 
   if (typeof body.temperature === "number") request.temperature = body.temperature
   if (typeof body.top_p === "number") request.top_p = body.top_p
 
-  return { request }
+  return { request, clientToolNames: new Set(client.map((tool) => tool.name)) }
 }

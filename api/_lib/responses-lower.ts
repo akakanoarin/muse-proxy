@@ -27,7 +27,7 @@ import {
 import { appendClientTools } from "./tools.js"
 
 export type NormalizeResult =
-  | { request: UpstreamRequest; stream: boolean }
+  | { request: UpstreamRequest; stream: boolean; clientToolNames: Set<string> }
   | { error: { status: number; message: string; code?: string } }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -229,36 +229,43 @@ function normalizeInputItem(
 // descriptions) first, then the client's own function tools. The Responses
 // API tool shape is flat ({type:"function", name, ...}), but clients that
 // mistakenly send the chat-nested shape are tolerated.
-function mergeToolsWithBuiltins(value: unknown): UpstreamTool[] {
+function mergeToolsWithBuiltins(value: unknown): { tools: UpstreamTool[]; clientToolNames: Set<string> } {
   const client: UpstreamTool[] = []
+  const names = new Set<string>()
   if (Array.isArray(value)) {
     for (const entry of value) {
       if (!isRecord(entry)) continue
       let name: string | undefined
       let description: string | undefined
       let parameters: Record<string, unknown> | undefined
+      let strict: boolean | undefined
       if (entry.type === "function") {
         name = asString(entry.name)
         description = asString(entry.description)
         parameters = isRecord(entry.parameters) ? entry.parameters : undefined
+        if (typeof entry.strict === "boolean") strict = entry.strict
         if (name === undefined && isRecord(entry.function)) {
           // Chat-nested shape fallback.
           const fn = entry.function
           name = asString(fn.name)
           description = asString(fn.description) ?? description
           parameters = isRecord(fn.parameters) ? fn.parameters : parameters
+          if (typeof fn.strict === "boolean") strict = fn.strict
         }
       }
       if (name === undefined) continue
-      client.push({
+      const tool: UpstreamTool = {
         type: "function",
         name,
         description: description ?? "",
         parameters: parameters ?? { type: "object", properties: {} },
-      })
+      }
+      if (strict !== undefined) tool.strict = strict
+      client.push(tool)
+      names.add(name)
     }
   }
-  return appendClientTools(client)
+  return { tools: appendClientTools(client), clientToolNames: names }
 }
 
 function clampMaxOutputTokens(value: unknown): number | undefined {
@@ -325,7 +332,8 @@ export function normalizeResponsesRequest(body: unknown, options: NormalizeOptio
 
   // Free-tier fingerprint: full opencode builtin set + client tools;
   // tool_choice is always "auto" upstream (same as the chat facade).
-  request.tools = mergeToolsWithBuiltins(body.tools)
+  const merged = mergeToolsWithBuiltins(body.tools)
+  request.tools = merged.tools
   request.tool_choice = "auto" as UpstreamToolChoice
 
   if (typeof body.temperature === "number") request.temperature = body.temperature
@@ -334,5 +342,5 @@ export function normalizeResponsesRequest(body: unknown, options: NormalizeOptio
   if (maxOutputTokens !== undefined) request.max_output_tokens = maxOutputTokens
 
   const wantsStream = body.stream === true
-  return { request, stream: wantsStream }
+  return { request, stream: wantsStream, clientToolNames: merged.clientToolNames }
 }

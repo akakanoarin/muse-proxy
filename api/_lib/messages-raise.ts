@@ -12,6 +12,7 @@
 // finish() emits an Anthropic `error` event so clients never mistake a
 // truncated stream for a complete message.
 
+import { shouldExposeToolCall } from "./tools.js"
 import type { UpstreamEvent } from "./types.js"
 
 export interface AnthropicEvent {
@@ -19,17 +20,28 @@ export interface AnthropicEvent {
   [key: string]: unknown
 }
 
+export interface MessageRaiserOptions {
+  messageId: string
+  model: string
+  clientToolNames?: ReadonlySet<string>
+  toolChoice?: unknown
+}
+
 export class MessageRaiser {
   private readonly messageId: string
   private readonly model: string
+  private readonly clientToolNames: ReadonlySet<string>
+  private readonly toolChoice: unknown
   private index = 0
   private openType: "text" | "thinking" | null = null
   private sawToolUse = false
   private finished = false
 
-  constructor(options: { messageId: string; model: string }) {
+  constructor(options: MessageRaiserOptions) {
     this.messageId = options.messageId
     this.model = options.model
+    this.clientToolNames = options.clientToolNames ?? new Set<string>()
+    this.toolChoice = options.toolChoice
   }
 
   // Anthropic streams always begin with message_start.
@@ -69,9 +81,10 @@ export class MessageRaiser {
     }
 
     if (event.type === "response.output_item.done" && event.item?.type === "function_call") {
-      this.closeBlock(out)
       const callId = event.item.call_id ?? event.item.id ?? ""
       const name = event.item.name ?? ""
+      if (!this.isExposed(name)) return out
+      this.closeBlock(out)
       const args = event.item.arguments ?? "{}"
       const blockIndex = this.index++
       out.push({
@@ -150,5 +163,16 @@ export class MessageRaiser {
     if (this.openType === null) return
     out.push({ type: "content_block_stop", index: this.index - 1 })
     this.openType = null
+  }
+
+  private isExposed(name: string): boolean {
+    if (this.toolChoice === "none") return false
+    if (typeof this.toolChoice === "object" && this.toolChoice !== null && !Array.isArray(this.toolChoice)) {
+      const record = this.toolChoice as Record<string, unknown>
+      if (record.type === "tool" && typeof record.name === "string") return name === record.name
+      if (record.type === "any") return shouldExposeToolCall(name, this.clientToolNames)
+      if (record.type === "auto") return shouldExposeToolCall(name, this.clientToolNames)
+    }
+    return shouldExposeToolCall(name, this.clientToolNames)
   }
 }

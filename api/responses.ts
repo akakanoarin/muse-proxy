@@ -17,6 +17,7 @@ import { jsonError, upstreamErrorToOpenAI } from "./_lib/errors.js"
 import { identityForCall } from "./_lib/identity.js"
 import { normalizeResponsesRequest } from "./_lib/responses-lower.js"
 import { HEARTBEAT_COMMENT, HEARTBEAT_INTERVAL_MS, parseUpstreamSse } from "./_lib/sse.js"
+import { shouldExposeToolCall } from "./_lib/tools.js"
 import type { UpstreamEvent, UpstreamUsage } from "./_lib/types.js"
 import { DEFAULT_REASONING_EFFORT, MODEL_ID, OPENCODE_CLIENT, OPENCODE_PROJECT_ID, UPSTREAM_API_KEY, UPSTREAM_URL, UPSTREAM_USER_AGENT } from "./_lib/types.js"
 
@@ -56,6 +57,7 @@ export class ResponseBuilder {
   upstreamResponseId: string | undefined
   /** True once a terminal event (completed/incomplete/failed/error) was seen. */
   sawTerminalEvent = false
+  clientToolNames: ReadonlySet<string> = new Set<string>()
 
   addEvent(raw: Record<string, unknown>) {
     const event = raw as unknown as UpstreamEvent
@@ -70,6 +72,9 @@ export class ResponseBuilder {
 
     if (event.type === "response.output_item.done" && event.item) {
       const item = event.item as unknown as OutputItem
+      if (item.type === "function_call" && typeof item.name === "string") {
+        if (!shouldExposeToolCall(item.name, this.clientToolNames)) return
+      }
       if (item.type === "message" && Array.isArray(item.content)) {
         for (const part of item.content) {
           const p = part as { type?: string; text?: string }
@@ -208,6 +213,7 @@ export async function handleResponsesRequest(
   // ------------------------------------------------------------------
   if (!wantsStream) {
     const builder = new ResponseBuilder()
+    builder.clientToolNames = normalized.clientToolNames
     for await (const event of events) {
       if (event === "done") break
       builder.addEvent(event)
@@ -257,6 +263,7 @@ export async function handleResponsesRequest(
 
       try {
         let sawTerminalEvent = false
+        const clientToolNames = normalized.clientToolNames
         for await (const event of events) {
           if (event === "done") break
           // opencode zen interleaves `ping` keep-alive frames inside the
@@ -266,6 +273,10 @@ export async function handleResponsesRequest(
           // stream; the proxy's own heartbeat comments already keep the
           // connection alive, so drop them here.
           if (event.type === "ping") continue
+          if (event.type === "response.output_item.done") {
+            const item = (event as Record<string, unknown>).item as Record<string, unknown> | undefined
+            if (item?.type === "function_call" && typeof item.name === "string" && !shouldExposeToolCall(item.name, clientToolNames)) continue
+          }
           if (
             event.type === "response.completed" ||
             event.type === "response.incomplete" ||

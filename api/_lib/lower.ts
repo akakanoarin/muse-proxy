@@ -24,7 +24,7 @@ import {
 } from "./types.js"
 
 export type LowerResult =
-  | { request: UpstreamRequest }
+  | { request: UpstreamRequest; clientToolNames: Set<string> }
   | { error: { status: number; message: string; code?: string } }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -153,7 +153,7 @@ const STUBBED_BUILTINS: UpstreamTool[] = OPENCODE_BUILTIN_TOOLS.map((tool) => ({
 // whose name collides with a builtin REPLACES the stub entry in place, so
 // the model sees the client's real description/parameters while the name
 // set still passes the gate.
-function mergeToolsWithBuiltins(value: unknown): UpstreamTool[] {
+function mergeToolsWithBuiltins(value: unknown): { tools: UpstreamTool[]; clientToolNames: Set<string> } {
   const clientByName = new Map<string, UpstreamTool>()
   if (Array.isArray(value)) {
     for (const entry of value) {
@@ -162,17 +162,20 @@ function mergeToolsWithBuiltins(value: unknown): UpstreamTool[] {
       const name = asString(fn?.name)
       if (name === undefined) continue
       const parameters = isRecord(fn?.parameters) ? fn.parameters : { type: "object", properties: {} }
-      clientByName.set(name, {
+      const tool: UpstreamTool = {
         type: "function",
         name,
         description: asString(fn?.description) ?? "",
         parameters,
-      })
+      }
+      if (typeof fn?.strict === "boolean") tool.strict = fn.strict
+      clientByName.set(name, tool)
     }
   }
-  return STUBBED_BUILTINS.map((tool) => clientByName.get(tool.name) ?? tool).concat(
+  const tools = STUBBED_BUILTINS.map((tool) => clientByName.get(tool.name) ?? tool).concat(
     [...clientByName.values()].filter((tool) => !BUILTIN_NAMES.has(tool.name)),
   )
+  return { tools, clientToolNames: new Set(clientByName.keys()) }
 }
 
 function clampMaxOutputTokens(chat: Record<string, unknown>): number | undefined {
@@ -267,7 +270,8 @@ export function lowerRequest(chat: unknown, options: LowerOptions = {}): LowerRe
 
   // Free-tier fingerprint: the full opencode builtin set must always be
   // present (client tools appended); tool_choice is always "auto" upstream.
-  request.tools = mergeToolsWithBuiltins(chat.tools)
+  const merged = mergeToolsWithBuiltins(chat.tools)
+  request.tools = merged.tools
   request.tool_choice = toolChoice()
 
   if (typeof chat.temperature === "number") request.temperature = chat.temperature
@@ -275,5 +279,5 @@ export function lowerRequest(chat: unknown, options: LowerOptions = {}): LowerRe
   const maxOutputTokens = clampMaxOutputTokens(chat)
   if (maxOutputTokens !== undefined) request.max_output_tokens = maxOutputTokens
 
-  return { request }
+  return { request, clientToolNames: merged.clientToolNames }
 }

@@ -10,6 +10,7 @@ import { identityForCall } from "./_lib/identity.js"
 import { lowerRequest } from "./_lib/lower.js"
 import { createRaiser } from "./_lib/raise.js"
 import { chunkToSse, DONE_LINE, HEARTBEAT_COMMENT, HEARTBEAT_INTERVAL_MS, parseUpstreamSse } from "./_lib/sse.js"
+import { shouldExposeToolCall } from "./_lib/tools.js"
 import type { ChatToolCall, ChatUsage, UpstreamEvent } from "./_lib/types.js"
 import { usageToChat } from "./_lib/usage.js"
 import { MODEL_ID, MODEL_NAME, OPENCODE_CLIENT, OPENCODE_PROJECT_ID, UPSTREAM_API_KEY, UPSTREAM_URL, UPSTREAM_USER_AGENT } from "./_lib/types.js"
@@ -31,6 +32,18 @@ function jsonResponse(res: { status: number; body: unknown }): Response {
   })
 }
 
+function isExposedChatTool(name: string, clientToolNames: ReadonlySet<string>, toolChoice: unknown): boolean {
+  if (toolChoice === "none") return false
+  if (typeof toolChoice === "object" && toolChoice !== null && !Array.isArray(toolChoice)) {
+    const record = toolChoice as Record<string, unknown>
+    if (record.type === "function" && typeof record.function === "object" && record.function !== null && !Array.isArray(record.function)) {
+      const forced = (record.function as Record<string, unknown>).name
+      if (typeof forced === "string") return name === forced
+    }
+  }
+  return shouldExposeToolCall(name, clientToolNames)
+}
+
 // Aggregate streamed chunks into a non-streaming chat.completion object.
 class CompletionBuilder {
   content = ""
@@ -38,6 +51,8 @@ class CompletionBuilder {
   toolCalls: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> = []
   finishReason: string | null = null
   usage: ChatUsage | undefined
+  clientToolNames: ReadonlySet<string> = new Set<string>()
+  toolChoice: unknown = undefined
 
   addEvent(event: UpstreamEvent) {
     if (event.type === "response.output_text.delta" && typeof event.delta === "string") {
@@ -53,11 +68,12 @@ class CompletionBuilder {
     }
     if (event.type === "response.output_item.done" && event.item?.type === "function_call") {
       const callId = event.item.call_id ?? event.item.id
-      if (callId && event.item.name) {
+      const name = event.item.name
+      if (callId && name && isExposedChatTool(name, this.clientToolNames, this.toolChoice)) {
         this.toolCalls.push({
           id: callId,
           type: "function",
-          function: { name: event.item.name, arguments: event.item.arguments ?? "" },
+          function: { name, arguments: event.item.arguments ?? "" },
         })
       }
       return
@@ -123,8 +139,9 @@ export async function handleChatRequest(
     return jsonResponse(jsonError(400, "request body must be valid JSON"))
   }
 
-  const chat = chatBody as { stream?: boolean }
+  const chat = chatBody as { stream?: boolean; tool_choice?: unknown }
   const wantsStream = chat.stream === true
+  const clientToolChoice = chat.tool_choice
 
   const completionId = `chatcmpl-${crypto.randomUUID()}`
   const created = Math.floor(Date.now() / 1000)
@@ -185,6 +202,8 @@ export async function handleChatRequest(
   // ------------------------------------------------------------------
   if (!wantsStream) {
     const builder = new CompletionBuilder()
+    builder.clientToolNames = lowered.clientToolNames
+    builder.toolChoice = clientToolChoice
     for await (const event of events) {
       if (event === "done") break
       builder.addEvent(event as unknown as UpstreamEvent)
@@ -199,7 +218,7 @@ export async function handleChatRequest(
   // Streaming: raise each upstream event into chat chunks over SSE.
   // ------------------------------------------------------------------
   const encoder = new TextEncoder()
-  const raiser = createRaiser({ id: completionId, created, model: MODEL_ID })
+  const raiser = createRaiser({ id: completionId, created, model: MODEL_ID, clientToolNames: lowered.clientToolNames, toolChoice: clientToolChoice })
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
