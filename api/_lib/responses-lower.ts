@@ -27,7 +27,7 @@ import {
 import { appendClientTools } from "./tools.js"
 
 export type NormalizeResult =
-  | { request: UpstreamRequest; stream: boolean; clientToolNames: Set<string> }
+  | { request: UpstreamRequest; stream: boolean; clientToolNames: Set<string>; nsPrefixByBare: Map<string, string> }
   | { error: { status: number; message: string; code?: string } }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -138,8 +138,11 @@ function reasoningReplayItem(_item: Record<string, unknown>): UpstreamInputItem 
 
 function functionCallItem(item: Record<string, unknown>): UpstreamInputItem | { error: true } {
   const callId = asString(item.call_id)
-  const name = asString(item.name)
-  if (callId === undefined || name === undefined) return { error: true }
+  const rawName = asString(item.name)
+  if (callId === undefined || rawName === undefined) return { error: true }
+  // 终端回传名为 muse.muse__read_file（点号命名空间 + 双下划线工具名），
+  // 上游只认识裸名 read_file，取最后一段剥离命名空间后透传。
+  const name = rawName.split(".").pop()!.split("__").pop()!
   const args = asString(item.arguments) ?? "{}"
   return { type: "function_call", call_id: callId, name, arguments: args }
 }
@@ -228,44 +231,62 @@ function normalizeInputItem(
 // Same rule as the chat facade: always send the full builtin set (stubbed
 // descriptions) first, then the client's own function tools. The Responses
 // API tool shape is flat ({type:"function", name, ...}), but clients that
-// mistakenly send the chat-nested shape are tolerated.
-function mergeToolsWithBuiltins(value: unknown): { tools: UpstreamTool[]; clientToolNames: Set<string> } {
+// mistakenly send the chat-nested shape are tolerated. Muse Code sends a
+// single {type:"namespace", name:"muse", tools:[...]} wrapper: its inner
+// functions are the real client tools and must be unwrapped, otherwise the
+// model never sees a callable tool and multi-turn tool loops cannot start.
+function flattenNamespaceTools(value: unknown): Array<{ entry: unknown; nsPrefix?: string }> {
+  if (!Array.isArray(value)) return []
+  const out: Array<{ entry: unknown; nsPrefix?: string }> = []
+  for (const entry of value) {
+    if (!isRecord(entry)) continue
+    if (entry.type === "namespace" && Array.isArray(entry.tools)) {
+      const prefix = asString(entry.name)
+      for (const inner of entry.tools) out.push({ entry: inner, nsPrefix: prefix })
+      continue
+    }
+    out.push({ entry })
+  }
+  return out
+}
+function mergeToolsWithBuiltins(value: unknown): { tools: UpstreamTool[]; clientToolNames: Set<string>; nsPrefixByBare: Map<string, string> } {
+  const flat = flattenNamespaceTools(value)
   const client: UpstreamTool[] = []
   const names = new Set<string>()
-  if (Array.isArray(value)) {
-    for (const entry of value) {
-      if (!isRecord(entry)) continue
-      let name: string | undefined
-      let description: string | undefined
-      let parameters: Record<string, unknown> | undefined
-      let strict: boolean | undefined
-      if (entry.type === "function") {
-        name = asString(entry.name)
-        description = asString(entry.description)
-        parameters = isRecord(entry.parameters) ? entry.parameters : undefined
-        if (typeof entry.strict === "boolean") strict = entry.strict
-        if (name === undefined && isRecord(entry.function)) {
-          // Chat-nested shape fallback.
-          const fn = entry.function
-          name = asString(fn.name)
-          description = asString(fn.description) ?? description
-          parameters = isRecord(fn.parameters) ? fn.parameters : parameters
-          if (typeof fn.strict === "boolean") strict = fn.strict
-        }
+  const nsPrefixByBare = new Map<string, string>()
+  for (const { entry, nsPrefix } of flat) {
+    if (!isRecord(entry)) continue
+    let name: string | undefined
+    let description: string | undefined
+    let parameters: Record<string, unknown> | undefined
+    let strict: boolean | undefined
+    if (entry.type === "function") {
+      name = asString(entry.name)
+      description = asString(entry.description)
+      parameters = isRecord(entry.parameters) ? entry.parameters : undefined
+      if (typeof entry.strict === "boolean") strict = entry.strict
+      if (name === undefined && isRecord(entry.function)) {
+        // Chat-nested shape fallback.
+        const fn = entry.function
+        name = asString(fn.name)
+        description = asString(fn.description) ?? description
+        parameters = isRecord(fn.parameters) ? fn.parameters : parameters
+        if (typeof fn.strict === "boolean") strict = fn.strict
       }
-      if (name === undefined) continue
-      const tool: UpstreamTool = {
-        type: "function",
-        name,
-        description: description ?? "",
-        parameters: parameters ?? { type: "object", properties: {} },
-      }
-      if (strict !== undefined) tool.strict = strict
-      client.push(tool)
-      names.add(name)
     }
+    if (name === undefined) continue
+    const tool: UpstreamTool = {
+      type: "function",
+      name,
+      description: description ?? "",
+      parameters: parameters ?? { type: "object", properties: {} },
+    }
+    if (strict !== undefined) tool.strict = strict
+    client.push(tool)
+    names.add(name)
+    if (nsPrefix !== undefined && !nsPrefixByBare.has(name)) nsPrefixByBare.set(name, nsPrefix)
   }
-  return { tools: appendClientTools(client), clientToolNames: names }
+  return { tools: appendClientTools(client), clientToolNames: names, nsPrefixByBare }
 }
 
 function clampMaxOutputTokens(value: unknown): number | undefined {
@@ -342,5 +363,5 @@ export function normalizeResponsesRequest(body: unknown, options: NormalizeOptio
   if (maxOutputTokens !== undefined) request.max_output_tokens = maxOutputTokens
 
   const wantsStream = body.stream === true
-  return { request, stream: wantsStream, clientToolNames: merged.clientToolNames }
+  return { request, stream: wantsStream, clientToolNames: merged.clientToolNames, nsPrefixByBare: merged.nsPrefixByBare }
 }

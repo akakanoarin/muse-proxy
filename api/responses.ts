@@ -58,6 +58,7 @@ export class ResponseBuilder {
   /** True once a terminal event (completed/incomplete/failed/error) was seen. */
   sawTerminalEvent = false
   clientToolNames: ReadonlySet<string> = new Set<string>()
+  nsPrefixByBare: ReadonlyMap<string, string> = new Map<string, string>()
 
   addEvent(raw: Record<string, unknown>) {
     const event = raw as unknown as UpstreamEvent
@@ -71,9 +72,12 @@ export class ResponseBuilder {
     }
 
     if (event.type === "response.output_item.done" && event.item) {
-      const item = event.item as unknown as OutputItem
+      const item = event.item as unknown as OutputItem & { name?: unknown }
       if (item.type === "function_call" && typeof item.name === "string") {
-        if (!shouldExposeToolCall(item.name, this.clientToolNames)) return
+        const toolName: string = item.name
+        const prefix = this.nsPrefixByBare.get(toolName)
+        if (prefix !== undefined && !toolName.startsWith(`${prefix}__`)) item.name = `${prefix}__${toolName}`
+        if (!shouldExposeToolCall(item.name as string, this.clientToolNames)) return
       }
       if (item.type === "message" && Array.isArray(item.content)) {
         for (const part of item.content) {
@@ -210,10 +214,10 @@ export async function handleResponsesRequest(
 
   // ------------------------------------------------------------------
   // Non-streaming: aggregate internally, respond with one JSON object.
-  // ------------------------------------------------------------------
   if (!wantsStream) {
     const builder = new ResponseBuilder()
     builder.clientToolNames = normalized.clientToolNames
+    builder.nsPrefixByBare = normalized.nsPrefixByBare
     for await (const event of events) {
       if (event === "done") break
       builder.addEvent(event)

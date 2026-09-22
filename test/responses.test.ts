@@ -93,6 +93,39 @@ describe("normalizeResponsesRequest", () => {
     ])
   })
 
+  it("unwraps namespace tools and strips dotted call names for upstream", () => {
+    const result = normalizeResponsesRequest({
+      input: "hi",
+      tools: [
+        {
+          type: "namespace",
+          name: "muse",
+          description: "Muse Code tool set.",
+          tools: [
+            { type: "function", name: "read_file", description: "read", parameters: { type: "object", properties: {} } },
+          ],
+        },
+      ],
+    })
+    if ("error" in result) throw new Error("unexpected error")
+    const names = (result.request.tools ?? []).map((tool) => tool.name)
+    expect(names).toContain("read_file")
+    expect(result.clientToolNames.has("read_file")).toBe(true)
+    expect(result.nsPrefixByBare.get("read_file")).toBe("muse")
+
+    const replay = normalizeResponsesRequest({
+      input: [
+        { type: "function_call", call_id: "c1", name: "muse.muse__read_file", arguments: "{}" },
+        { type: "function_call_output", call_id: "c1", output: "ok" },
+      ],
+    })
+    if ("error" in replay) throw new Error("unexpected error")
+    expect(replay.request.input).toEqual([
+      { type: "function_call", call_id: "c1", name: "read_file", arguments: "{}" },
+      { type: "function_call_output", call_id: "c1", output: "ok" },
+    ])
+  })
+
   it("drops all reasoning replay items (session-bound blobs rejected upstream)", () => {
     const result = normalizeResponsesRequest({
       input: [
@@ -418,6 +451,35 @@ describe("responses endpoint integration", () => {
     expect(res.status).toBe(400)
     expect(calls).toHaveLength(0)
   })
+  it("non-streaming: restores namespace prefix on client function_call items", async () => {
+    mockUpstream([
+      sseResponse([
+        {
+          type: "response.output_item.done",
+          item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "read_file", arguments: '{"path":"x"}' },
+        },
+        { type: "response.completed", response: { usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } } },
+      ]),
+    ])
+    const res = await handleResponsesRequest(
+      post({
+        input: "hi",
+        tools: [
+          {
+            type: "namespace",
+            name: "muse",
+            description: "Muse Code tool set.",
+            tools: [{ type: "function", name: "read_file", description: "read", parameters: { type: "object", properties: {} } }],
+          },
+        ],
+      }),
+      ENV,
+    )
+    const body = (await res.json()) as Record<string, unknown>
+    const output = body.output as Array<Record<string, unknown>>
+    expect(output.map((item) => item.name)).toEqual(["muse__read_file"])
+  })
+
 
   it("non-streaming: drops hidden builtin function_call items but keeps client calls", async () => {
     mockUpstream([
