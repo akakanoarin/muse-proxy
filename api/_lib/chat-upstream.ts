@@ -76,15 +76,6 @@ function assistantItemToMessages(
   return { role: "assistant", content: item.content.map((part) => part.text).join("") }
 }
 
-function functionCallItemToMessage(item: Extract<UpstreamInputItem, { type: "function_call" }>): Record<string, unknown> {
-  return {
-    role: "assistant",
-    content: null,
-    tool_calls: [
-      { id: item.call_id, type: "function", function: { name: item.name, arguments: item.arguments } },
-    ],
-  }
-}
 
 function functionCallOutputItemToMessage(
   item: Extract<UpstreamInputItem, { type: "function_call_output" }>,
@@ -94,16 +85,28 @@ function functionCallOutputItemToMessage(
 
 export function lowerInputToMessages(input: UpstreamInputItem[]): Array<Record<string, unknown>> {
   const messages: Array<Record<string, unknown>> = []
+  // 连续 function_call 必须合并成一条 assistant 消息携带全部 tool_calls。
+  // space-bunny 上游把同轮并行调用拆成多条 assistant 消息直接判 400，
+  // 直打上游对照已确认：拆分必 400，合并必 200。
+  let pendingCalls: Array<Record<string, unknown>> = []
+  const flushPendingCalls = () => {
+    if (pendingCalls.length > 0) {
+      messages.push({ role: "assistant", content: null, tool_calls: pendingCalls })
+      pendingCalls = []
+    }
+  }
   for (const item of input) {
     // Encrypted reasoning replay is session-bound; drop (same as muse path).
     if ("type" in item) {
       if (item.type === "function_call") {
-        messages.push(functionCallItemToMessage(item))
+        pendingCalls.push({ id: item.call_id, type: "function", function: { name: item.name, arguments: item.arguments } })
       } else if (item.type === "function_call_output") {
+        flushPendingCalls()
         messages.push(functionCallOutputItemToMessage(item))
       }
       continue
     }
+    flushPendingCalls()
     if (item.role === "system") {
       messages.push(systemItemToMessage(item))
     } else if (item.role === "user") {
@@ -112,6 +115,7 @@ export function lowerInputToMessages(input: UpstreamInputItem[]): Array<Record<s
       messages.push(assistantItemToMessages(item))
     }
   }
+  flushPendingCalls()
   return messages
 }
 

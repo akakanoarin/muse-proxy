@@ -24,7 +24,7 @@ client ──chat/completions──▶ muse-proxy ─┬─lower──▶ openco
                                                           └─raise─▶ 同一套 raise 层
 ```
 
-新增的两个 oa-compat 模型(`api/_lib/chat-upstream.ts` + `api/_lib/oa-compat.ts`):降级(Responses input → chat messages,含 function_call 轮次回放)与升格(chat-completions SSE → 规范 Responses 事件生命周期:`response.created` → `output_item.added` → 文本/思考 delta → `output_text.done`/`output_item.done` → `response.completed`),三个门面共享同一转换层,语义(muse 门的工具暴露、心跳、终止事件守护)与 muse 路径完全一致。对 OpenMinis 2026-09-02 源码 (`4ef2900`) 的 Responses 解析器还补齐了 function-call 的 `output_item.added` → `function_call_arguments.delta` → `function_call_arguments.done` → `output_item.done` 顺序,避免工具参数被严格客户端静默丢弃。`/v1/models` 目录已包含全部三个模型。
+新增的两个 oa-compat 模型(`api/_lib/chat-upstream.ts` + `api/_lib/oa-compat.ts`):降级(Responses input → chat messages,含 function_call 轮次回放：连续并行调用合并成一条 `assistant(content=null, tool_calls=[...])`，拆散上游直接 400)与升格(chat-completions SSE → 规范 Responses 事件生命周期:`response.created` → `output_item.added` → 文本/思考 delta → `output_text.done`/`output_item.done` → `response.completed`),三个门面共享同一转换层,语义(muse 门的工具暴露、心跳、终止事件守护)与 muse 路径完全一致。对 OpenMinis 2026-09-02 源码 (`4ef2900`) 的 Responses 解析器还补齐了 function-call 的 `output_item.added` → `function_call_arguments.delta` → `function_call_arguments.done` → `output_item.done` 顺序,避免工具参数被严格客户端静默丢弃。`/v1/models` 目录已包含全部三个模型。
 
 ## 模型目录
 
@@ -57,8 +57,8 @@ client ──chat/completions──▶ muse-proxy ─┬─lower──▶ openco
 - **定位**:匿名限时预览的推理模型,面向编码、agent 任务、工具调用与多模态输入(免费层,限时提供)。
 - **别名**:`model id 包含 "space-bunny"` 即匹配(如 `space-bunny`、`space-bunny-free-preview`)。
 - **思考**:reasoning 恒开;接受全部档位 `minimal/low/medium/high/xhigh/max`(比官方目录还多接受 `minimal`);请求 `none` 会被 `clampEffortForModel` 钳制为 `minimal`——直接转发上游会 400;Anthropic 门面 `thinking:{type:"disabled"}` 同样钳制为 `minimal`。
+- **并行工具调用**:同轮多个 `tool_calls` 必须合并在一条 `assistant` 消息里回放,拆成多条 `assistant` 消息(每条带一个调用)上游直接 400 `invalid_request_error`。网关客户端习惯并行调用,多轮后必触发,表现为“聊几句就报错”。代理已在 `api/_lib/chat-upstream.ts` 的 `lowerInputToMessages` 内把连续 `function_call` 聚合成一条 `assistant(content=null, tool_calls=[...])`,三个门面共用,无需客户端改形状。
 - **路由格式**:`oa-compat`(chat completions);走 `/v1/responses` 上游返回 401 `ModelError: not supported for format openai`。
-- **定义处**:`api/_lib/types.ts` 的 `SPACE_BUNNY_INFO`。
 
 > 上表的档位接受度均为 2026-09-24 逐档位实测结论(`scripts/probe-reasoning-efforts.ts`);路由与钳制逻辑集中在 `api/_lib/types.ts`(`resolveModel` / `clampEffortForModel`),三个门面共用,新增模型时先更新 `MODELS` 目录再跑 `bun run smoke:newmodels` 与 `bun run smoke:efforts`。
 
@@ -66,7 +66,7 @@ client ──chat/completions──▶ muse-proxy ─┬─lower──▶ openco
 
 ```bash
 bun install            # 或 npm install
-bun run test           # 155 个单元/集成/沙箱端到端测试(mock 上游,无需联网)
+bun run test           # 156 个单元/集成/沙箱端到端测试(mock 上游,无需联网)
 bun run smoke          # 真实连通性冒烟(需联网,验证 stream:false 与 stream:true)
 bun run smoke:responses # /v1/responses 真实上游全功能冒烟(需联网,7 项 36 检查)
 bun run smoke:messages  # /v1/messages 真实上游全功能冒烟(需联网,8 项任务)

@@ -46,6 +46,30 @@ describe("lowerInputToMessages", () => {
       { role: "tool", tool_call_id: "call_1", content: "echoed: hi" },
     ])
   })
+  it("merges parallel function_calls into one assistant message", () => {
+    const input: UpstreamInputItem[] = [
+      { type: "function_call", call_id: "call_1", name: "read", arguments: "{\"path\":\"a\"}" },
+      { type: "function_call", call_id: "call_2", name: "read", arguments: "{\"path\":\"b\"}" },
+      { type: "function_call", call_id: "call_3", name: "read", arguments: "{\"path\":\"c\"}" },
+      { type: "function_call_output", call_id: "call_1", output: "A" },
+      { type: "function_call_output", call_id: "call_2", output: "B" },
+      { type: "function_call_output", call_id: "call_3", output: "C" },
+    ]
+    expect(lowerInputToMessages(input)).toEqual([
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          { id: "call_1", type: "function", function: { name: "read", arguments: "{\"path\":\"a\"}" } },
+          { id: "call_2", type: "function", function: { name: "read", arguments: "{\"path\":\"b\"}" } },
+          { id: "call_3", type: "function", function: { name: "read", arguments: "{\"path\":\"c\"}" } },
+        ],
+      },
+      { role: "tool", tool_call_id: "call_1", content: "A" },
+      { role: "tool", tool_call_id: "call_2", content: "B" },
+      { role: "tool", tool_call_id: "call_3", content: "C" },
+    ])
+  })
 
   it("drops reasoning replay items (session-bound blobs)", () => {
     const input = [
