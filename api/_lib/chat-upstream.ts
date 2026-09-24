@@ -188,6 +188,11 @@ interface PendingToolCall {
   id: string
   name: string
   arguments: string
+  /** Output position announced to Responses clients. */
+  outputIndex: number
+  announced: boolean
+  /** Number of argument characters already emitted as delta events. */
+  announcedArguments: number
 }
 
 // Raises oa-compat chat-completions chunks into the FULL canonical Responses
@@ -210,6 +215,8 @@ export class OaCompatRaiser {
   private textSoFar = ""
   private messageIndex: number | undefined
   private itemIdSeq = 0
+  /** Completed output items keyed by their Responses output_index. */
+  private readonly outputItems = new Map<number, Record<string, unknown>>()
 
   constructor(model: string, responseId?: string, createdAt?: number) {
     this.model = model
@@ -254,6 +261,14 @@ export class OaCompatRaiser {
     if (!this.openedMessage) return
     this.openedMessage = false
     const itemId = `msg_${this.responseId}`
+    const item: Record<string, unknown> = {
+      type: "message",
+      id: itemId,
+      role: "assistant",
+      status: "completed",
+      content: [{ type: "output_text", text: this.textSoFar }],
+    }
+    this.outputItems.set(this.messageIndex!, item)
     events.push(
       {
         type: "response.output_text.done",
@@ -272,13 +287,7 @@ export class OaCompatRaiser {
       {
         type: "response.output_item.done",
         output_index: this.messageIndex,
-        item: {
-          type: "message",
-          id: itemId,
-          role: "assistant",
-          status: "completed",
-          content: [{ type: "output_text", text: this.textSoFar }],
-        },
+        item,
       },
     )
   }
@@ -311,11 +320,34 @@ export class OaCompatRaiser {
           const call = raw as Record<string, unknown>
           const index = typeof call.index === "number" ? call.index : 0
           const fn = (typeof call.function === "object" && call.function !== null ? call.function : {}) as Record<string, unknown>
-          const existing = this.toolCalls.get(index) ?? { index, id: "", name: "", arguments: "" }
+          const existing = this.toolCalls.get(index) ?? {
+            index,
+            id: "",
+            name: "",
+            arguments: "",
+            outputIndex: -1,
+            announced: false,
+            announcedArguments: 0,
+          }
           if (typeof call.id === "string" && call.id) existing.id = call.id
           if (typeof fn.name === "string" && fn.name) existing.name = fn.name
-          if (typeof fn.arguments === "string") existing.arguments += fn.arguments
+          const argumentDelta = typeof fn.arguments === "string" ? fn.arguments : ""
+          if (argumentDelta) existing.arguments += argumentDelta
           this.toolCalls.set(index, existing)
+
+          // A Responses client (including OpenMinis) starts a function-call
+          // accumulator only on output_item.added.  The previous raiser emitted
+          // only output_item.done, so a strict Responses consumer silently lost
+          // every oa-compat tool call.  Announce the item as soon as its name is
+          // known, then stream each argument fragment as a Responses delta.
+          if (existing.name) {
+            const wasAnnounced = existing.announced
+            this.announceToolCall(existing, events)
+            if (wasAnnounced && argumentDelta) {
+              events.push(this.toolArgumentsDelta(existing, argumentDelta))
+              existing.announcedArguments += argumentDelta.length
+            }
+          }
         }
       }
       if (typeof record.finish_reason === "string" && record.finish_reason) {
@@ -348,7 +380,9 @@ export class OaCompatRaiser {
         created_at: this.createdAt,
         status: "completed",
         model: this.model,
-        output: [],
+        output: [...this.outputItems.entries()]
+          .sort(([a], [b]) => a - b)
+          .map(([, item]) => item),
         error: null,
         incomplete_details: null,
         usage: this.usage ? this.mapUsage(this.usage) : null,
@@ -371,21 +405,80 @@ export class OaCompatRaiser {
     }
   }
 
+  private toolCallId(call: PendingToolCall): string {
+    const callId = call.id || `call_${call.index}`
+    return callId.startsWith("fc_") ? callId : `fc_${callId}`
+  }
+
+  private toolArgumentsDelta(call: PendingToolCall, delta: string): ResponsesEvent {
+    return {
+      type: "response.function_call_arguments.delta",
+      item_id: this.toolCallId(call),
+      output_index: call.outputIndex,
+      delta,
+    }
+  }
+
+  private announceToolCall(call: PendingToolCall, events: ResponsesEvent[]): void {
+    if (call.announced || !call.name) return
+    if (call.outputIndex < 0) call.outputIndex = this.itemIdSeq++
+    call.announced = true
+    const itemId = this.toolCallId(call)
+    events.push({
+      type: "response.output_item.added",
+      output_index: call.outputIndex,
+      item: {
+        type: "function_call",
+        id: itemId,
+        call_id: call.id || `call_${call.index}`,
+        name: call.name,
+        arguments: "",
+        status: "in_progress",
+      },
+    })
+    // A few oa-compat responses put the first argument fragment in the same
+    // chunk as the name.  That fragment was accumulated before announcement;
+    // emit it once here instead of dropping it or duplicating it below.
+    if (call.arguments.length > 0) {
+      events.push(this.toolArgumentsDelta(call, call.arguments))
+      call.announcedArguments = call.arguments.length
+    }
+  }
+
   private flushToolCalls(): ResponsesEvent[] {
     if (this.toolCalls.size === 0) return []
     const events: ResponsesEvent[] = []
     for (const call of [...this.toolCalls.values()].sort((a, b) => a.index - b.index)) {
-      events.push({
-        type: "response.output_item.done",
-        output_index: this.itemIdSeq++,
-        item: {
-          type: "function_call",
-          id: call.id || `call_${call.index}`,
-          call_id: call.id || `call_${call.index}`,
-          name: call.name,
+      this.announceToolCall(call, events)
+      if (!call.name) continue
+      if (call.announcedArguments < call.arguments.length) {
+        const remaining = call.arguments.slice(call.announcedArguments)
+        events.push(this.toolArgumentsDelta(call, remaining))
+        call.announcedArguments = call.arguments.length
+      }
+      const itemId = this.toolCallId(call)
+      const item: Record<string, unknown> = {
+        type: "function_call",
+        id: itemId,
+        call_id: call.id || `call_${call.index}`,
+        name: call.name,
+        arguments: call.arguments,
+        status: "completed",
+      }
+      this.outputItems.set(call.outputIndex, item)
+      events.push(
+        {
+          type: "response.function_call_arguments.done",
+          item_id: itemId,
+          output_index: call.outputIndex,
           arguments: call.arguments,
         },
-      })
+        {
+          type: "response.output_item.done",
+          output_index: call.outputIndex,
+          item,
+        },
+      )
     }
     this.toolCalls.clear()
     return events

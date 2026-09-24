@@ -4,7 +4,7 @@
 
 import { describe, expect, it } from "vitest"
 import { OaCompatRaiser, isDonePayload, lowerChatUpstream, lowerInputToMessages, toolsToChatShape } from "../api/_lib/chat-upstream"
-import { MODELS, resolveModel, MODEL_MUSE, type UpstreamInputItem } from "../api/_lib/types"
+import { MODELS, resolveModel, MODEL_MUSE, type UpstreamInputItem, type UpstreamTool } from "../api/_lib/types"
 import { modelsList } from "../api/models"
 
 describe("lowerInputToMessages", () => {
@@ -245,15 +245,44 @@ describe("OaCompatRaiser: canonical Responses lifecycle", () => {
       ...raiser.handle({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] }),
       ...raiser.finishStream(),
     ]
+    const toolAdded = events.find((e) => e.type === "response.output_item.added" && (e.item as { type?: string }).type === "function_call")
     const toolDone = events.filter((e) => e.type === "response.output_item.done" && (e.item as { type?: string }).type === "function_call")
+    const argumentDeltas = events
+      .filter((e) => e.type === "response.function_call_arguments.delta")
+      .map((e) => (e as { delta?: string }).delta ?? "")
+      .join("")
+    expect(toolAdded).toBeDefined()
     expect(toolDone).toHaveLength(1)
-    const item = (toolDone[0] as unknown as { item: { call_id: string; name: string; arguments: string } }).item
+    expect(argumentDeltas).toBe("{\"text\":\"hi\"}")
+    const added = toolAdded as unknown as { item: { id: string; call_id: string; name: string } }
+    const item = (toolDone[0] as unknown as { item: { id: string; call_id: string; name: string; arguments: string } }).item
+    expect(added.item.id).toBe(item.id)
     expect(item.call_id).toBe("call_1")
     expect(item.name).toBe("echo")
     expect(item.arguments).toBe("{\"text\":\"hi\"}")
+    expect(events.some((e) => e.type === "response.function_call_arguments.done")).toBe(true)
 
     const completedIdx = events.map((e) => e.type).lastIndexOf("response.completed")
+    expect(events.map((e) => e.type).indexOf("response.output_item.added")).toBeLessThan(completedIdx)
     expect(events.map((e) => e.type).indexOf("response.output_item.done")).toBeLessThan(completedIdx)
+  })
+
+  it("keeps response.completed output ordered when a tool precedes text", () => {
+    const raiser = new OaCompatRaiser("space-bunny-free", "resp_test_order", 123)
+    const events = [
+      ...raiser.handle(chunk({ tool_calls: [{ index: 0, id: "call_order", function: { name: "file_write", arguments: "{}" } }] })),
+      ...raiser.handle(chunk({ content: "完成" })),
+      ...raiser.handle({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] }),
+      ...raiser.finishStream(),
+    ]
+    const completed = events.at(-1) as unknown as { response: { output: Array<{ type: string }> } }
+    expect(completed.response.output.map((item) => item.type)).toEqual(["function_call", "message"])
+    expect(completed.response.output[0]).toMatchObject({
+      type: "function_call",
+      id: "fc_call_order",
+      call_id: "call_order",
+      name: "file_write",
+    })
   })
 
   it("ignores the trailing cost frame (choices: []) and malformed JSON", () => {
@@ -272,5 +301,43 @@ describe("OaCompatRaiser: canonical Responses lifecycle", () => {
     const types = events.map((e) => e.type)
     expect(types[0]).toBe("response.created")
     expect(types.at(-1)).toBe("response.completed")
+  })
+
+  it("preserves the exact OpenMinis file_write schema through the chat converter", () => {
+    const openMinisFileWrite: UpstreamTool = {
+      type: "function",
+      name: "file_write",
+      description: "Write content to a file on the Linux filesystem.",
+      parameters: {
+        type: "object",
+        properties: {
+          tool_title: { type: "string", description: "A concise title" },
+          path: { type: "string", description: "Absolute Linux path" },
+          content: { type: "string", description: "Text content" },
+          append: { type: "boolean", description: "Append instead of overwrite" },
+          create_dirs: { type: "boolean", description: "Create parent directories" },
+        },
+        required: ["tool_title", "path", "content"],
+      },
+    }
+    const converted = toolsToChatShape([openMinisFileWrite])
+    expect(converted[0]).toEqual({
+      type: "function",
+      function: {
+        name: "file_write",
+        description: "Write content to a file on the Linux filesystem.",
+        parameters: openMinisFileWrite.parameters,
+      },
+    })
+
+    const request = lowerChatUpstream({
+      model: MODELS["space-bunny-free"]!,
+      input: [{ role: "user", content: [{ type: "input_text", text: "写入文件" }] }],
+      tools: [openMinisFileWrite],
+      effort: "high",
+    })
+    const sent = request.tools?.find((tool) => tool.function.name === "file_write")
+    expect(sent?.function.parameters).toEqual(openMinisFileWrite.parameters)
+    expect(request.reasoning_effort).toBe("high")
   })
 })

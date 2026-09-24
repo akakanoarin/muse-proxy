@@ -24,7 +24,7 @@ client ──chat/completions──▶ muse-proxy ─┬─lower──▶ openco
                                                           └─raise─▶ 同一套 raise 层
 ```
 
-新增的两个 oa-compat 模型(`api/_lib/chat-upstream.ts` + `api/_lib/oa-compat.ts`):降级(Responses input → chat messages,含 function_call 轮次回放)与升格(chat-completions SSE → 规范 Responses 事件生命周期:`response.created` → `output_item.added` → 文本/思考 delta → `output_text.done`/`output_item.done` → `response.completed`),三个门面共享同一转换层,语义(muse 门的工具暴露、心跳、终止事件守护)与 muse 路径完全一致。`/v1/models` 目录已包含全部三个模型。
+新增的两个 oa-compat 模型(`api/_lib/chat-upstream.ts` + `api/_lib/oa-compat.ts`):降级(Responses input → chat messages,含 function_call 轮次回放)与升格(chat-completions SSE → 规范 Responses 事件生命周期:`response.created` → `output_item.added` → 文本/思考 delta → `output_text.done`/`output_item.done` → `response.completed`),三个门面共享同一转换层,语义(muse 门的工具暴露、心跳、终止事件守护)与 muse 路径完全一致。对 OpenMinis 2026-09-02 源码 (`4ef2900`) 的 Responses 解析器还补齐了 function-call 的 `output_item.added` → `function_call_arguments.delta` → `function_call_arguments.done` → `output_item.done` 顺序,避免工具参数被严格客户端静默丢弃。`/v1/models` 目录已包含全部三个模型。
 
 ## 模型目录
 
@@ -66,13 +66,14 @@ client ──chat/completions──▶ muse-proxy ─┬─lower──▶ openco
 
 ```bash
 bun install            # 或 npm install
-bun run test           # 147 个单元/集成/沙箱端到端测试(mock 上游,无需联网)
+bun run test           # 155 个单元/集成/沙箱端到端测试(mock 上游,无需联网)
 bun run smoke          # 真实连通性冒烟(需联网,验证 stream:false 与 stream:true)
 bun run smoke:responses # /v1/responses 真实上游全功能冒烟(需联网,7 项 36 检查)
 bun run smoke:messages  # /v1/messages 真实上游全功能冒烟(需联网,8 项任务)
 bun run smoke:newmodels # 两个新模型 × 三门面全链路真实上游冒烟(需联网,9 项任务 × 2 模型 + muse 回归)
 bun run smoke:efforts  # 思考强度档位真实上游冒烟:/v1/models 元数据 + 档位端到端 + none 钳制
 bun run smoke:tools    # agent 工具循环真实上游冒烟:3 模型 × 3 门面,流式 tool call → 执行 → 回传 → 结果落地
+bun run smoke:openminis # OpenMinis file_write 真实上游探针:3 门面 × 5 个参数的全量回放 + 模型生成工具调用
 bun run eval           # 完整 agent 评测:xhigh 思考 + web_search 工具循环 + 3 轮多轮对话
 bun run typecheck
 ```
@@ -94,7 +95,7 @@ curl -X POST https://your-proxy/v1/responses \
 - `input`:字符串,或数组项 `{role, content}` / `{type:"message"}`(user 支持 `input_text`/`input_image` parts,assistant 支持 `output_text`)、`{type:"function_call"}`、`{type:"function_call_output"}`、`{type:"reasoning"}`(加密思考回放项原样透传)
 - `instructions`:转为首条 system 消息;`reasoning.effort`:白名单同 chat 端点(默认 `high`)
 - `tools`:Responses 扁平 function 工具(误传 chat 嵌套形状也兼容),追加在内置工具之后
-- `stream:true`:按 Responses 流式规范以 `event: <type>` + `data: <json>` 帧逐事件透传上游事件(不发 `[DONE]`,与 OpenAI Responses 流式一致),带心跳注释;上游混入的非规范 `ping` 保活帧被过滤(`response.completed` 始终是终止事件);若上游未发终止事件就断流,合成 `error`(`upstream_stream_truncated`)事件再关闭,截断不会被误当成正常完成
+- `stream:true`:按 Responses 流式规范以 `event: <type>` + `data: <json>` 帧逐事件透传上游事件(不发 `[DONE]`,与 OpenAI Responses 流式一致),带心跳注释;oa-compat 模型会合成完整 function-call 生命周期(`output_item.added`、`function_call_arguments.delta/done`、`output_item.done`),兼容 OpenMinis 等严格 Responses 客户端;上游混入的非规范 `ping` 保活帧被过滤(`response.completed` 始终是终止事件);若上游未发终止事件就断流,合成 `error`(`upstream_stream_truncated`)事件再关闭,截断不会被误当成正常完成
 - `stream:false`:聚合为单个 `response` 对象(`object:"response"`、`output`、`output_text`、`usage`、`status: completed/incomplete`);上游断流未发终止事件时返回 502 `upstream_stream_truncated`,绝不把截断输出标成 `completed`
 
 有意的限制(免费层契约):

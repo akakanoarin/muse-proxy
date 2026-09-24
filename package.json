@@ -11,6 +11,7 @@
     "smoke:newmodels": "bun run scripts/smoke-newmodels.ts",
     "smoke:efforts": "bun run scripts/smoke-efforts.ts",
     "smoke:tools": "bun run scripts/smoke-agent-tools.ts",
+    "smoke:openminis": "bun run scripts/probe-openminis-spacebunny.ts",
     "eval": "bun run scripts/agent-eval.ts"
   },
   "devDependencies": {

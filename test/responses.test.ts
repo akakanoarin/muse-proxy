@@ -343,6 +343,77 @@ describe("responses endpoint integration", () => {
     expect(body.error.code).toBe("provider_error")
   })
 
+  it("oa-compat streaming exposes the complete Responses function-call lifecycle for OpenMinis", async () => {
+    mockUpstream([
+      sseResponse([
+        {
+          choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call_file", function: { name: "file_write", arguments: '{"tool_title"' } }] }, finish_reason: null }],
+        },
+        {
+          choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: ':"写入文件","path":"/root/pelican.html","content":"ok","append":false,"create_dirs":true}' } }] }, finish_reason: null }],
+        },
+        { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+      ]),
+    ])
+
+    const res = await handleResponsesRequest(
+      post({
+        model: "space-bunny-free",
+        input: "写入文件",
+        stream: true,
+        tools: [{
+          type: "function",
+          name: "file_write",
+          description: "Write content to a file.",
+          parameters: {
+            type: "object",
+            properties: {
+              tool_title: { type: "string" },
+              path: { type: "string" },
+              content: { type: "string" },
+              append: { type: "boolean" },
+              create_dirs: { type: "boolean" },
+            },
+            required: ["tool_title", "path", "content"],
+          },
+        }],
+      }),
+      ENV,
+    )
+    expect(res.status).toBe(200)
+    const frames = (await res.text())
+      .split("\n\n")
+      .filter((block) => block.startsWith("event: "))
+      .map((block) => {
+        const lines = block.split("\n")
+        return { type: lines[0]!.slice(7), data: JSON.parse(lines[1]!.slice(6)) as Record<string, unknown> }
+      })
+    const types = frames.map((frame) => frame.type)
+    expect(types[0]).toBe("response.created")
+    expect(types).toContain("response.output_item.added")
+    expect(types).toContain("response.function_call_arguments.delta")
+    expect(types).toContain("response.function_call_arguments.done")
+    expect(types).toContain("response.output_item.done")
+    expect(types.indexOf("response.output_item.added")).toBeLessThan(types.indexOf("response.function_call_arguments.delta"))
+    expect(types.indexOf("response.function_call_arguments.delta")).toBeLessThan(types.indexOf("response.output_item.done"))
+    expect(types.at(-1)).toBe("response.completed")
+
+    const added = frames.find((frame) => frame.type === "response.output_item.added")!.data as { item: { id: string } }
+    const done = frames.find((frame) => frame.type === "response.output_item.done")!.data as { item: { id: string; call_id: string; name: string; arguments: string } }
+    expect(added.item.id).toBe(done.item.id)
+    expect(added.item.id).toMatch(/^fc_/)
+    const argumentDelta = frames.find((frame) => frame.type === "response.function_call_arguments.delta")!.data as { item_id: string; delta: string }
+    expect(argumentDelta.item_id).toBe(done.item.id)
+    expect(done.item.call_id).toBe("call_file")
+    expect(done.item.name).toBe("file_write")
+    expect(done.item.arguments).toContain('"create_dirs":true')
+    const deltas = frames
+      .filter((frame) => frame.type === "response.function_call_arguments.delta")
+      .map((frame) => (frame.data as { delta?: string }).delta ?? "")
+      .join("")
+    expect(deltas).toBe(done.item.arguments)
+  })
+
   it("streaming: forwards upstream events verbatim with event:/data: framing and no [DONE] line", async () => {
     mockUpstream([
       sseResponse([
