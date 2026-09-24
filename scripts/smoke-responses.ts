@@ -271,8 +271,9 @@ async function task6ToolLoop(): Promise<void> {
       },
     ]
 
+    const turn1UserText = "北京今天天气怎么样?你必须调用 get_weather 工具查询,禁止自己编造天气。"
     const turn1Res = await post({
-      input: "北京今天天气怎么样?你必须调用 get_weather 工具查询,禁止自己编造天气。",
+      input: turn1UserText,
       tools,
       stream: false,
     })
@@ -290,6 +291,7 @@ async function task6ToolLoop(): Promise<void> {
 
     const turn2Res = await post({
       input: [
+        { role: "user", content: turn1UserText },
         ...items1,
         { type: "function_call_output", call_id: call.call_id, output: "北京今天晴,26°C,微风" },
       ],
@@ -306,10 +308,11 @@ async function task6ToolLoop(): Promise<void> {
 }
 
 async function task7Memory(): Promise<void> {
-  console.log("\n[7/7] multi-turn memory (output items replayed into input)")
+  console.log("\n[7/7] multi-turn memory (full conversation replayed into input)")
   try {
+    const turn1UserText = "请记住暗号:蓝鲸计划。只回复四个字:已记住暗号。"
     const turn1Res = await post({
-      input: "请记住暗号:蓝鲸计划。只回复四个字:已记住暗号。",
+      input: turn1UserText,
       stream: false,
     })
     expect(turn1Res.status === 200, "turn1 HTTP 200", `status=${turn1Res.status}`)
@@ -318,8 +321,16 @@ async function task7Memory(): Promise<void> {
     const types = items1.map((item) => item.type)
     expect(types.includes("message"), "turn1 output has an assistant message", JSON.stringify(types))
 
+    // A real agent replays the FULL conversation: the original user message
+    // plus turn1's output items. The encrypted reasoning item is dropped
+    // input-side (session-bound), so the passphrase only survives in the
+    // replayed user text — which is exactly how stateless multi-turn works.
     const turn2Res = await post({
-      input: [...items1, { role: "user", content: "暗号是什么?只回答暗号内容。" }],
+      input: [
+        { role: "user", content: turn1UserText },
+        ...items1,
+        { role: "user", content: "暗号是什么?只回答暗号内容。" },
+      ],
       stream: false,
     })
     expect(turn2Res.status === 200, "turn2 HTTP 200", `status=${turn2Res.status}`)

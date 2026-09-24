@@ -12,7 +12,9 @@ import { createRaiser } from "./_lib/raise.js"
 import { chunkToSse, DONE_LINE, HEARTBEAT_COMMENT, HEARTBEAT_INTERVAL_MS, parseUpstreamSse } from "./_lib/sse.js"
 import { shouldExposeToolCall } from "./_lib/tools.js"
 import type { ChatToolCall, ChatUsage, UpstreamEvent } from "./_lib/types.js"
+import { resolveModel } from "./_lib/types.js"
 import { usageToChat } from "./_lib/usage.js"
+import { handleOaCompatUpstream } from "./_lib/oa-compat.js"
 import { MODEL_ID, MODEL_NAME, OPENCODE_CLIENT, OPENCODE_PROJECT_ID, UPSTREAM_API_KEY, UPSTREAM_URL, UPSTREAM_USER_AGENT } from "./_lib/types.js"
 
 export interface ChatEnv {
@@ -96,7 +98,7 @@ class CompletionBuilder {
     }
   }
 
-  build(id: string, created: number): Record<string, unknown> {
+  build(id: string, created: number, model: string): Record<string, unknown> {
     const message: Record<string, unknown> = { role: "assistant", content: this.content }
     if (this.reasoning.length > 0) message.reasoning_content = this.reasoning
     if (this.toolCalls.length > 0) message.tool_calls = this.toolCalls
@@ -104,7 +106,7 @@ class CompletionBuilder {
       id,
       object: "chat.completion",
       created,
-      model: MODEL_ID,
+      model,
       choices: [
         {
           index: 0,
@@ -152,6 +154,103 @@ export async function handleChatRequest(
   const lowered = lowerRequest(chatBody, { sessionId: identity.sessionId })
   if ("error" in lowered) {
     return jsonResponse(jsonError(lowered.error.status, lowered.error.message, lowered.error.code))
+  }
+
+  // Model routing: the two new free models live on the oa-compat format
+  // (/v1/chat/completions upstream); muse keeps the untouched Responses path.
+  const resolved = resolveModel((chatBody as { model?: unknown }).model)
+  if (resolved.upstream === "oa-compat") {
+    return handleOaCompatUpstream(
+      {
+        callId: completionId,
+        identity,
+        model: resolved,
+        input: lowered.request.input,
+        tools: lowered.request.tools ?? [],
+        effort: lowered.request.reasoning?.effort,
+        temperature: lowered.request.temperature,
+        topP: lowered.request.top_p,
+        maxOutputTokens: lowered.request.max_output_tokens,
+        signal: request.signal,
+        fetchImpl,
+        renderUpstreamError: (status, body) => jsonResponse(upstreamErrorToOpenAI(status, body)),
+        renderNetworkError: (message) =>
+          jsonResponse(jsonError(502, message, "upstream_unreachable", "api_error")),
+      },
+      async (events) => {
+        // Non-streaming: aggregate internally, respond with one JSON object.
+        if (!wantsStream) {
+          const builder = new CompletionBuilder()
+          builder.clientToolNames = lowered.clientToolNames
+          builder.toolChoice = clientToolChoice
+          for await (const event of events) {
+            if (event === "done") break
+            builder.addEvent(event as unknown as UpstreamEvent)
+          }
+          return new Response(JSON.stringify(builder.build(completionId, created, resolved.id)), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          })
+        }
+        // Streaming: raise each upstream event into chat chunks over SSE.
+        const encoder = new TextEncoder()
+        const raiser = createRaiser({
+          id: completionId,
+          created,
+          model: resolved.id,
+          clientToolNames: lowered.clientToolNames,
+          toolChoice: clientToolChoice,
+        })
+        const stream = new ReadableStream<Uint8Array>({
+          async start(controller) {
+            let closed = false
+            const push = (text: string) => {
+              if (!closed) controller.enqueue(encoder.encode(text))
+            }
+            const heartbeat = setInterval(() => push(HEARTBEAT_COMMENT), HEARTBEAT_INTERVAL_MS)
+            try {
+              push(
+                chunkToSse({
+                  id: completionId,
+                  object: "chat.completion.chunk",
+                  created,
+                  model: resolved.id,
+                  choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }],
+                }),
+              )
+              for await (const event of events) {
+                if (event === "done") break
+                for (const chunkOut of raiser.handle(event as unknown as UpstreamEvent)) {
+                  push(chunkToSse(chunkOut))
+                }
+              }
+              for (const chunkOut of raiser.finish()) push(chunkToSse(chunkOut))
+              push(DONE_LINE)
+            } catch (error) {
+              const message = error instanceof Error ? error.message : "stream interrupted"
+              push(chunkToSse(errorChunk(completionId, created, resolved.id, message)))
+              push(DONE_LINE)
+            } finally {
+              clearInterval(heartbeat)
+              if (!closed) {
+                closed = true
+                controller.close()
+              }
+            }
+          },
+          cancel() {},
+        })
+        return new Response(stream, {
+          status: 200,
+          headers: {
+            "content-type": "text/event-stream; charset=utf-8",
+            "cache-control": "no-cache, no-transform",
+            connection: "keep-alive",
+            "x-accel-buffering": "no",
+          },
+        })
+      },
+    )
   }
 
   let upstream: Response
@@ -208,7 +307,7 @@ export async function handleChatRequest(
       if (event === "done") break
       builder.addEvent(event as unknown as UpstreamEvent)
     }
-    return new Response(JSON.stringify(builder.build(completionId, created)), {
+    return new Response(JSON.stringify(builder.build(completionId, created, MODEL_ID)), {
       status: 200,
       headers: { "content-type": "application/json" },
     })

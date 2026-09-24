@@ -1,27 +1,78 @@
 # muse-proxy
 
-一个把 opencode zen 的免费模型(muse spark 1.3 contributor)包装成标准 OpenAI Chat Completions API 的无状态代理,零运行时依赖,可部署到 Vercel 等 edge/Node 环境。
+一个把 opencode zen 的免费模型包装成标准 OpenAI Chat Completions / Responses 与 Anthropic Messages API 的无状态代理,零运行时依赖,可部署到 Vercel 等 edge/Node 环境。
 
 - **入站**:`POST /api/chat`(OpenAI `/v1/chat/completions` 兼容,支持流式 SSE 与聚合 JSON、工具调用、`reasoning_effort`)
 - **入站**:`POST /api/responses`(OpenAI `/v1/responses` Responses API 规范,支持流式 SSE 与聚合 JSON、工具调用、加密思考回放,详见下文)
 - **入站**:`POST /api/messages`(Anthropic `/v1/messages` Messages API 规范,支持流式 SSE 与聚合 JSON、工具调用、thinking 块,详见下文)
-- **出站**:`POST https://opencode.ai/zen/v1/responses`(OpenAI Responses API + SSE)
+- **出站**:按模型分格式路由(zen 边缘按格式路由,2026-09-24 探针确认):
+  - `muse-spark-1.3-contributor-free` → `POST https://opencode.ai/zen/v1/responses`(OpenAI Responses API + SSE)
+  - `mimo-v2.6-flash-free` → `POST https://opencode.ai/zen/v1/chat/completions`(oa-compat;走 `/v1/responses` 上游直接 500)
+  - `space-bunny-free` → `POST https://opencode.ai/zen/v1/chat/completions`(oa-compat;走 `/v1/responses` 上游 401 `ModelError: not supported for format openai`)
 - **鉴权**:`Authorization: Bearer $PROXY_API_KEY` 或 `x-api-key: $PROXY_API_KEY`(三个端点共用同一鉴权逻辑)。**未设置 `PROXY_API_KEY` 环境变量时,所有端点一律返回 401(fail-closed),不存在开放模式**
 - **免费模型**:上游 API key 固定为字面量 `public`,匿名免费层按 IP 限额,无需注册
+- **模型路由**(`api/_lib/types.ts` 的 `resolveModel`):显式匹配 `mimo*`/`space-bunny*`/`muse*` 前缀,其余任意 model id 沿用历史行为回落 muse;三个端点对同一 model id 语义一致
+- **思考强度**:逐档位实测上游接受度(2026-09-24,`scripts/probe-reasoning-efforts.ts`),`/v1/models` 每个模型暴露 `reasoning` + `reasoning_levels`:
+  - `muse-spark-1.3-contributor-free`:`none/minimal/low/medium/high/xhigh`(`max` 上游 400);Anthropic 门面的 `thinking.budget_tokens` 档位映射不变
+  - `mimo-v2.6-flash-free`:reasoning **恒开**,`reasoning_effort` 上游容忍但无效,故不暴露档位、不下发该字段
+  - `space-bunny-free`:`minimal/low/medium/high/xhigh/max`(目录外还多接受 `minimal`);请求 `none` 会被钳制为 `minimal`(直接转发上游 400);Anthropic 门面 `thinking:{type:"disabled"}` 同样钳制为 `minimal`
+  - 钳制逻辑集中在 `clampEffortForModel`(`api/_lib/types.ts`),三个门面共用
 
 ```
-client ──chat/completions──▶ muse-proxy ──lower──▶ opencode zen /v1/responses
-        ◀──SSE chunks────             ◀──raise──  (Responses SSE)
+client ──chat/completions──▶ muse-proxy ─┬─lower──▶ opencode zen /v1/responses      (muse)
+        ◀──SSE chunks────               └─chat-upstream──▶ /v1/chat/completions    (mimo / space-bunny)
+                                                          └─raise─▶ 同一套 raise 层
 ```
+
+新增的两个 oa-compat 模型(`api/_lib/chat-upstream.ts` + `api/_lib/oa-compat.ts`):降级(Responses input → chat messages,含 function_call 轮次回放)与升格(chat-completions SSE → 规范 Responses 事件生命周期:`response.created` → `output_item.added` → 文本/思考 delta → `output_text.done`/`output_item.done` → `response.completed`),三个门面共享同一转换层,语义(muse 门的工具暴露、心跳、终止事件守护)与 muse 路径完全一致。`/v1/models` 目录已包含全部三个模型。
+
+## 模型目录
+
+代理当前服务 **3 个 opencode zen 免费模型**。`GET /v1/models`(`api/models.ts`)按 OpenAI models-list 格式返回下表全部模型,每个条目携带 `reasoning`(是否思考)与 `reasoning_levels`(支持的思考强度档位,空数组 = 无档位控制)元数据,另有 `context_window` / `max_output_tokens` / `owned_by: "opencode-zen"`。所有模型共享免费匿名层:上游 API key 固定为字面量 `public`,按 IP 限额,无需注册;三个 API 门面(chat / responses / messages)对同一 model id 语义一致。
+
+| 模型 ID | 名称 | 上游格式(出站路由) | 上下文窗口 | 最大输出 | 思考 | 思考强度档位 |
+|---|---|---|---|---|---|---|
+| `muse-spark-1.3-contributor-free` | Muse Spark 1.3 Contributor Free (opencode zen) | `responses` → `POST https://opencode.ai/zen/v1/responses` | 1,048,576 | 32,000 | ✅ | `none / minimal / low / medium / high / xhigh`(默认 `high`;`max` 上游 400) |
+| `mimo-v2.6-flash-free` | MiMo-V2.6-Flash Free | `oa-compat` → `POST https://opencode.ai/zen/v1/chat/completions` | 200,000 | 32,000 | ✅ 恒开 | 无(上游容忍 `reasoning_effort` 但无效,代理不下发该字段) |
+| `space-bunny-free` | Space Bunny Free | `oa-compat` → `POST https://opencode.ai/zen/v1/chat/completions` | 1,048,576 | 32,000 | ✅ 恒开 | `minimal / low / medium / high / xhigh / max`(`none` 钳制为 `minimal`,直接转发上游 400) |
+
+### muse-spark-1.3-contributor-free(默认模型)
+
+- **定位**:Muse Spark 1.3 Contributor 免费层,经 opencode zen 原生 Responses 上游提供;**任何未知/未匹配的 model id 都回落到这里**(历史行为,永不报 404)。
+- **别名**:`model id 含 "muse"` 即匹配(如 `muse`、`muse-spark-1.3`)。
+- **思考**:支持**加密思考回放**——流式/聚合响应携带 `encrypted_content`(Responses 门面)或 `reasoning_details`(chat 门面),多轮对话原样透传回上游;Anthropic 门面的 `thinking.budget_tokens` 档位映射不变(`<2048→low`、`<8192→medium`、`<24576→high`、`≥24576→xhigh`,`disabled→none`)。
+- **路由格式**:唯一走 `responses` 上游的模型(`lower.ts` 直发 `/zen/v1/responses`)。
+- **定义处**:`api/_lib/types.ts` 的 `MUSE_INFO`。
+
+### mimo-v2.6-flash-free
+
+- **定位**:MiMo Flash,面向多模态编码 agent 与长上下文自动化(免费层)。
+- **别名**:`model id 以 "mimo" 开头(大小写不敏感)即匹配——包括 zen 付费目录名 `mimo-v2.6-flash`(由免费上游变体服务)。
+- **思考**:reasoning **恒开且无法关闭**;`reasoning_effort` / `reasoning.effort` / `thinking.budget_tokens` 会被接受并静默丢弃(上游 200 但无效),`/v1/models` 不暴露档位,代理也不向下游发该字段。
+- **路由格式**:`oa-compat`(chat completions);走 `/v1/responses` 上游会直接 500,opencode CLI 同样经 `@ai-sdk/openai-compatible` 调用它。
+- **定义处**:`api/_lib/types.ts` 的 `MIMO_INFO`。
+
+### space-bunny-free
+
+- **定位**:匿名限时预览的推理模型,面向编码、agent 任务、工具调用与多模态输入(免费层,限时提供)。
+- **别名**:`model id 包含 "space-bunny"` 即匹配(如 `space-bunny`、`space-bunny-free-preview`)。
+- **思考**:reasoning 恒开;接受全部档位 `minimal/low/medium/high/xhigh/max`(比官方目录还多接受 `minimal`);请求 `none` 会被 `clampEffortForModel` 钳制为 `minimal`——直接转发上游会 400;Anthropic 门面 `thinking:{type:"disabled"}` 同样钳制为 `minimal`。
+- **路由格式**:`oa-compat`(chat completions);走 `/v1/responses` 上游返回 401 `ModelError: not supported for format openai`。
+- **定义处**:`api/_lib/types.ts` 的 `SPACE_BUNNY_INFO`。
+
+> 上表的档位接受度均为 2026-09-24 逐档位实测结论(`scripts/probe-reasoning-efforts.ts`);路由与钳制逻辑集中在 `api/_lib/types.ts`(`resolveModel` / `clampEffortForModel`),三个门面共用,新增模型时先更新 `MODELS` 目录再跑 `bun run smoke:newmodels` 与 `bun run smoke:efforts`。
 
 ## 快速开始
 
 ```bash
 bun install            # 或 npm install
-bun run test           # 128 个单元/集成/沙箱端到端测试(mock 上游,无需联网)
+bun run test           # 147 个单元/集成/沙箱端到端测试(mock 上游,无需联网)
 bun run smoke          # 真实连通性冒烟(需联网,验证 stream:false 与 stream:true)
 bun run smoke:responses # /v1/responses 真实上游全功能冒烟(需联网,7 项 36 检查)
 bun run smoke:messages  # /v1/messages 真实上游全功能冒烟(需联网,8 项任务)
+bun run smoke:newmodels # 两个新模型 × 三门面全链路真实上游冒烟(需联网,9 项任务 × 2 模型 + muse 回归)
+bun run smoke:efforts  # 思考强度档位真实上游冒烟:/v1/models 元数据 + 档位端到端 + none 钳制
+bun run smoke:tools    # agent 工具循环真实上游冒烟:3 模型 × 3 门面,流式 tool call → 执行 → 回传 → 结果落地
 bun run eval           # 完整 agent 评测:xhigh 思考 + web_search 工具循环 + 3 轮多轮对话
 bun run typecheck
 ```

@@ -28,15 +28,136 @@ export const UPSTREAM_USER_AGENT = `opencode/${OPENCODE_VERSION} ai-sdk/provider
 // The CLI sends x-opencode-project: "global" (project id of a global home
 // session); the edge accepts any value, but match the real client.
 export const OPENCODE_PROJECT_ID = "global"
-// Every requested model maps to the free contributor model.
-export const MODEL_ID = "muse-spark-1.3-contributor-free"
-export const MODEL_NAME = "Muse Spark 1.3 Contributor Free (opencode zen)"
-// opencode OUTPUT_TOKEN_MAX (packages/opencode/src/provider/transform.ts).
-export const MAX_OUTPUT_TOKENS = 32_000
 
 export const REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh"] as const
 export type ReasoningEffort = (typeof REASONING_EFFORTS)[number]
 export const DEFAULT_REASONING_EFFORT: ReasoningEffort = "high"
+
+// ---------------------------------------------------------------------------
+// Model catalog + routing
+// ---------------------------------------------------------------------------
+// The zen edge routes each model by FORMAT, and free models live on different
+// formats (probed 2026-09-24, opencode 1.18.32 + models.opencode.ai catalog):
+//   - muse-spark-1.3-contributor-free  -> "openai"  (/zen/v1/responses)
+//   - mimo-v2.6-flash-free             -> "oa-compat" (/zen/v1/chat/completions)
+//     (on /v1/responses the upstream 500s; the CLI ships it via
+//      @ai-sdk/openai-compatible, i.e. chat completions)
+//   - space-bunny-free                 -> "oa-compat"
+//     (on /v1/responses it 401s "Model space-bunny-free is not supported
+//      for format openai")
+// The muse paths (types.ts + lower*.ts + chat-upstream-less handlers) must
+// stay untouched; new models therefore route through a dedicated converter
+// (_lib/chat-upstream.ts) while muse keeps using the Responses upstream.
+export const MODEL_MUSE = "muse-spark-1.3-contributor-free"
+export const MODEL_MIMO = "mimo-v2.6-flash-free"
+export const MODEL_SPACE_BUNNY = "space-bunny-free"
+
+export type UpstreamFormat = "responses" | "oa-compat"
+
+export interface ModelInfo {
+  /** Client-facing model id (accepts several aliases per upstream model). */
+  id: string
+  /** Human display name as reported by /v1/models. */
+  name: string
+  upstream: UpstreamFormat
+  description: string
+  contextWindow: number
+  maxOutputTokens: number
+  /** Reasoning effort values accepted upstream ([] = no effort control). */
+  efforts: readonly string[]
+  /** Convenience: keep muse defaults working via the old MODEL_ID constant. */
+  isMuse?: boolean
+}
+
+// Effort levels come from the models.opencode.ai catalog (reasoning_options)
+// verified against the real edge with a per-value probe (2026-09-24,
+// scripts/probe-reasoning-efforts.ts):
+//   - muse: none..xhigh accepted, max 400s (invalid parameters).
+//   - mimo: reasoning is ALWAYS ON; reasoning_effort is tolerated (200) but
+//     has no effect, so no effort levels are advertised or sent.
+//   - space-bunny: minimal/low/medium/high/xhigh/max all 200; "none" 400s
+//     (upstream invalid_request_error) even though the catalog omits it —
+//     the edge accepts MORE than the catalog lists, except none.
+const MUSE_INFO: ModelInfo = {
+  id: MODEL_MUSE,
+  name: "Muse Spark 1.3 Contributor Free (opencode zen)",
+  upstream: "responses",
+  description:
+    "Muse Spark 1.3 Contributor (free tier) served via opencode zen with encrypted-reasoning replay. Any unknown model id falls back here.",
+  contextWindow: 1_048_576,
+  maxOutputTokens: 32_000,
+  efforts: REASONING_EFFORTS,
+  isMuse: true,
+}
+const MIMO_INFO: ModelInfo = {
+  id: MODEL_MIMO,
+  name: "MiMo-V2.6-Flash Free",
+  upstream: "oa-compat",
+  description:
+    "MiMo Flash for multimodal coding agents and long-context automation (free tier). Reasoning is always on; effort control is not supported.",
+  contextWindow: 200_000,
+  maxOutputTokens: 32_000,
+  efforts: [],
+}
+const SPACE_BUNNY_INFO: ModelInfo = {
+  id: MODEL_SPACE_BUNNY,
+  name: "Space Bunny Free",
+  upstream: "oa-compat",
+  description:
+    "Anonymous preview reasoning model for coding, agentic tasks, tool use, and multimodal input (free tier, limited time). Reasoning is always on; effort levels minimal–max, with none clamped to minimal.",
+  contextWindow: 1_048_576,
+  maxOutputTokens: 32_000,
+  efforts: ["minimal", "low", "medium", "high", "xhigh", "max"],
+}
+
+export const MODELS: Record<string, ModelInfo> = {
+  [MODEL_MUSE]: MUSE_INFO,
+  [MODEL_MIMO]: MIMO_INFO,
+  [MODEL_SPACE_BUNNY]: SPACE_BUNNY_INFO,
+}
+
+export const DEFAULT_MODEL_ID = MODEL_MUSE
+
+/**
+ * Clamp a facade-mapped effort to the levels a model actually accepts.
+ *
+ * Returns undefined when the model has no effort control (mimo: reasoning is
+ * always on, the field is dropped) or the requested value is undefined.
+ * space-bunny rejects "none" upstream (400), so it clamps to its lowest
+ * accepted level instead of being forwarded. Muse keeps its historical
+ * whitelist untouched (REASONING_EFFORTS, which already contains none).
+ */
+export function clampEffortForModel(model: ModelInfo, effort: string | undefined): string | undefined {
+  if (effort === undefined || model.efforts.length === 0) return undefined
+  if ((model.efforts as readonly string[]).includes(effort)) return effort
+  if (effort === "none") return model.efforts[0]
+  return undefined
+}
+
+/**
+ * Resolve a client-requested model id to a catalog entry.
+ *
+ * Aliases collapse onto the same upstream free model (e.g. the paid zen
+ * name "mimo-v2.6-flash" is served by the free upstream variant), and any
+ * unknown id keeps the historical muse behavior (never an error).
+ */
+export function resolveModel(requested: unknown): ModelInfo {
+  if (typeof requested !== "string" || requested.length === 0) return MUSE_INFO
+  const direct = MODELS[requested]
+  if (direct) return direct
+  const normalized = requested.toLowerCase()
+  if (normalized.startsWith("mimo")) return MIMO_INFO
+  if (normalized.includes("space-bunny")) return SPACE_BUNNY_INFO
+  if (normalized.includes("muse")) return MUSE_INFO
+  return MUSE_INFO
+}
+
+// Legacy alias: identical to MODEL_MUSE (historical lower modules + tests
+// reference MODEL_ID; the muse path keeps working unchanged).
+export const MODEL_ID = MODEL_MUSE
+export const MODEL_NAME = "Muse Spark 1.3 Contributor Free (opencode zen)"
+// opencode OUTPUT_TOKEN_MAX (packages/opencode/src/provider/transform.ts).
+export const MAX_OUTPUT_TOKENS = 32_000
 
 // ---------------------------------------------------------------------------
 // Upstream (OpenAI Responses API) types

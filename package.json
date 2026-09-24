@@ -8,6 +8,9 @@
     "smoke": "bun run scripts/smoke.ts",
     "smoke:responses": "bun run scripts/smoke-responses.ts",
     "smoke:messages": "bun run scripts/smoke-messages.ts",
+    "smoke:newmodels": "bun run scripts/smoke-newmodels.ts",
+    "smoke:efforts": "bun run scripts/smoke-efforts.ts",
+    "smoke:tools": "bun run scripts/smoke-agent-tools.ts",
     "eval": "bun run scripts/agent-eval.ts"
   },
   "devDependencies": {

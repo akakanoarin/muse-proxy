@@ -19,7 +19,8 @@ import { normalizeResponsesRequest } from "./_lib/responses-lower.js"
 import { HEARTBEAT_COMMENT, HEARTBEAT_INTERVAL_MS, parseUpstreamSse } from "./_lib/sse.js"
 import { shouldExposeToolCall } from "./_lib/tools.js"
 import type { UpstreamEvent, UpstreamUsage } from "./_lib/types.js"
-import { DEFAULT_REASONING_EFFORT, MODEL_ID, OPENCODE_CLIENT, OPENCODE_PROJECT_ID, UPSTREAM_API_KEY, UPSTREAM_URL, UPSTREAM_USER_AGENT } from "./_lib/types.js"
+import { DEFAULT_REASONING_EFFORT, MODEL_ID, OPENCODE_CLIENT, OPENCODE_PROJECT_ID, UPSTREAM_API_KEY, UPSTREAM_URL, UPSTREAM_USER_AGENT, resolveModel } from "./_lib/types.js"
+import { handleOaCompatUpstream } from "./_lib/oa-compat.js"
 
 export interface ResponsesEnv {
   PROXY_API_KEY?: string
@@ -174,6 +175,150 @@ export async function handleResponsesRequest(
     return jsonResponse(jsonError(normalized.error.status, normalized.error.message, normalized.error.code))
   }
   const wantsStream = normalized.stream
+
+  // Model routing: the two new free models live on the oa-compat format
+  // (/v1/chat/completions upstream); muse keeps the untouched Responses path.
+  const resolved = resolveModel((rawBody as { model?: unknown } | null)?.model)
+  if (resolved.upstream === "oa-compat") {
+    return handleOaCompatUpstream(
+      {
+        callId: responseId,
+        identity,
+        model: resolved,
+        input: normalized.request.input,
+        tools: normalized.request.tools ?? [],
+        effort: normalized.request.reasoning?.effort,
+        temperature: normalized.request.temperature,
+        topP: normalized.request.top_p,
+        maxOutputTokens: normalized.request.max_output_tokens,
+        signal: request.signal,
+        fetchImpl,
+        renderUpstreamError: (status, body) => jsonResponse(upstreamErrorToOpenAI(status, body)),
+        renderNetworkError: (message) =>
+          jsonResponse(jsonError(502, message, "upstream_unreachable", "api_error")),
+      },
+      async (events) => {
+        // Non-streaming: aggregate internally, respond with one JSON object.
+        if (!wantsStream) {
+          const builder = new ResponseBuilder()
+          builder.clientToolNames = normalized.clientToolNames
+          builder.nsPrefixByBare = normalized.nsPrefixByBare
+          for await (const event of events) {
+            if (event === "done") break
+            builder.addEvent(event)
+          }
+          if (builder.status === "failed") {
+            return jsonResponse(jsonError(502, builder.error?.message ?? "upstream error", builder.error?.code ?? "upstream_error", "api_error"))
+          }
+          if (!builder.sawTerminalEvent) {
+            return jsonResponse(jsonError(502, "upstream closed the stream before a terminal response event", "upstream_stream_truncated", "api_error"))
+          }
+          const echo: Record<string, unknown> = {
+            model: resolved.id,
+            temperature: normalized.request.temperature ?? null,
+            top_p: normalized.request.top_p ?? null,
+            max_output_tokens: normalized.request.max_output_tokens ?? null,
+            tool_choice: "auto",
+            reasoning: { effort: normalized.request.reasoning?.effort ?? DEFAULT_REASONING_EFFORT, summary: "auto" },
+          }
+          return new Response(JSON.stringify(builder.build(responseId, createdAt, echo)), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          })
+        }
+        // Streaming: re-frame raised events as canonical Responses SSE.
+        const encoder = new TextEncoder()
+        const stream = new ReadableStream<Uint8Array>({
+          async start(controller) {
+            let closed = false
+            const push = (text: string) => {
+              if (!closed) controller.enqueue(encoder.encode(text))
+            }
+            const heartbeat = setInterval(() => push(HEARTBEAT_COMMENT), HEARTBEAT_INTERVAL_MS)
+            const frameEvent = (event: Record<string, unknown>): string => {
+              const type = typeof event.type === "string" ? event.type : undefined
+              const data = `data: ${JSON.stringify(event)}\n\n`
+              return type !== undefined ? `event: ${type}\n${data}` : data
+            }
+            try {
+              let sawTerminalEvent = false
+              const clientToolNames = normalized.clientToolNames
+              // Mirror the muse-path hidden-builtin filtering: drop builtin
+              // tool calls the client cannot execute across the whole event
+              // sequence (added/delta/done + terminal response.output).
+              const hiddenItemIds = new Set<string>()
+              for await (const event of events) {
+                if (event === "done") break
+                if (event.type === "ping") continue
+                if (event.type === "response.output_item.added") {
+                  const item = event.item as Record<string, unknown> | undefined
+                  if (item?.type === "function_call" && typeof item.name === "string" && !shouldExposeToolCall(item.name, clientToolNames)) {
+                    if (typeof item.id === "string") hiddenItemIds.add(item.id)
+                    continue
+                  }
+                }
+                if (event.type === "response.function_call_arguments.delta" || event.type === "response.function_call_arguments.done") {
+                  const itemId = typeof event.item_id === "string" ? event.item_id : undefined
+                  const name = typeof event.name === "string" ? event.name : undefined
+                  if ((itemId !== undefined && hiddenItemIds.has(itemId)) || (name !== undefined && !shouldExposeToolCall(name, clientToolNames))) {
+                    continue
+                  }
+                }
+                if (event.type === "response.output_item.done") {
+                  const item = (event as Record<string, unknown>).item as Record<string, unknown> | undefined
+                  if (item?.type === "function_call" && typeof item.name === "string" && !shouldExposeToolCall(item.name, clientToolNames)) {
+                    if (typeof item.id === "string") hiddenItemIds.delete(item.id)
+                    continue
+                  }
+                }
+                if (event.type === "response.completed" || event.type === "response.incomplete") {
+                  const response = event.response as Record<string, unknown> | undefined
+                  const output = response?.output
+                  if (response && Array.isArray(output)) {
+                    response.output = output.filter((entry) => {
+                      if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return true
+                      const record = entry as Record<string, unknown>
+                      return !(record.type === "function_call" && typeof record.name === "string" && !shouldExposeToolCall(record.name, clientToolNames))
+                    })
+                  }
+                  sawTerminalEvent = true
+                } else if (event.type === "response.failed" || event.type === "error") {
+                  sawTerminalEvent = true
+                }
+                push(frameEvent(event))
+              }
+              if (!sawTerminalEvent) {
+                push(frameEvent({
+                  type: "error",
+                  code: "upstream_stream_truncated",
+                  message: "upstream closed the stream before a terminal response event",
+                }))
+              }
+            } catch (error) {
+              const message = error instanceof Error ? error.message : "stream interrupted"
+              push(frameEvent({ type: "error", code: "proxy_stream_error", message }))
+            } finally {
+              clearInterval(heartbeat)
+              if (!closed) {
+                closed = true
+                controller.close()
+              }
+            }
+          },
+          cancel() {},
+        })
+        return new Response(stream, {
+          status: 200,
+          headers: {
+            "content-type": "text/event-stream; charset=utf-8",
+            "cache-control": "no-cache, no-transform",
+            connection: "keep-alive",
+            "x-accel-buffering": "no",
+          },
+        })
+      },
+    )
+  }
 
   let upstream: Response
   try {

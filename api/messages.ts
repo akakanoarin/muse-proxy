@@ -19,7 +19,8 @@ import { lowerMessagesRequest } from "./_lib/messages-lower.js"
 import { HEARTBEAT_COMMENT, HEARTBEAT_INTERVAL_MS, parseUpstreamSse } from "./_lib/sse.js"
 import { shouldExposeToolCall } from "./_lib/tools.js"
 import type { UpstreamEvent, UpstreamUsage } from "./_lib/types.js"
-import { MODEL_ID, OPENCODE_CLIENT, OPENCODE_PROJECT_ID, UPSTREAM_API_KEY, UPSTREAM_URL, UPSTREAM_USER_AGENT } from "./_lib/types.js"
+import { MODEL_ID, OPENCODE_CLIENT, OPENCODE_PROJECT_ID, UPSTREAM_API_KEY, UPSTREAM_URL, UPSTREAM_USER_AGENT, resolveModel } from "./_lib/types.js"
+import { handleOaCompatUpstream } from "./_lib/oa-compat.js"
 
 export interface MessagesEnv {
   PROXY_API_KEY?: string
@@ -211,6 +212,104 @@ export async function handleMessagesRequest(
   const lowered = lowerMessagesRequest(rawBody, { sessionId: identity.sessionId })
   if ("error" in lowered) {
     return anthropicError(lowered.error.status, "invalid_request_error", lowered.error.message)
+  }
+
+  // Model routing: the two new free models live on the oa-compat format
+  // (/v1/chat/completions upstream); muse keeps the untouched Responses path.
+  const resolved = resolveModel((rawBody as { model?: unknown } | null)?.model)
+  if (resolved.upstream === "oa-compat") {
+    return handleOaCompatUpstream(
+      {
+        callId: messageId,
+        identity,
+        model: resolved,
+        input: lowered.request.input,
+        tools: lowered.request.tools ?? [],
+        effort: lowered.request.reasoning?.effort,
+        temperature: lowered.request.temperature,
+        topP: lowered.request.top_p,
+        maxOutputTokens: lowered.request.max_output_tokens,
+        signal: request.signal,
+        fetchImpl,
+        renderUpstreamError: (status, body) => upstreamErrorToAnthropic(status, body),
+        renderNetworkError: (message) => anthropicError(502, "api_error", message),
+      },
+      async (events) => {
+        // Non-streaming: aggregate internally, respond with one JSON message.
+        if (!wantsStream) {
+          const builder = new MessageBuilder()
+          builder.clientToolNames = lowered.clientToolNames
+          builder.toolChoice = clientToolChoice
+          for await (const event of events) {
+            if (event === "done") break
+            builder.addEvent(event)
+          }
+          if (builder.error) {
+            return anthropicError(502, "api_error", builder.error.message)
+          }
+          if (!builder.sawTerminalEvent) {
+            return anthropicError(502, "api_error", "upstream closed the stream before a terminal response event")
+          }
+          return new Response(JSON.stringify(builder.build(messageId, resolved.id)), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          })
+        }
+        // Streaming: raise each upstream event into Anthropic SSE events.
+        const encoder = new TextEncoder()
+        const raiser = new MessageRaiser({
+          messageId,
+          model: resolved.id,
+          clientToolNames: lowered.clientToolNames,
+          toolChoice: clientToolChoice,
+        })
+        const stream = new ReadableStream<Uint8Array>({
+          async start(controller) {
+            let closed = false
+            const push = (text: string) => {
+              if (!closed) controller.enqueue(encoder.encode(text))
+            }
+            const heartbeat = setInterval(() => push(HEARTBEAT_COMMENT), HEARTBEAT_INTERVAL_MS)
+            const frameEvent = (event: AnthropicEvent): string => {
+              const data = `data: ${JSON.stringify(event)}\n\n`
+              return `event: ${event.type}\n${data}`
+            }
+            try {
+              push(frameEvent(raiser.start()))
+              for await (const event of events) {
+                if (event === "done") break
+                if (event.type === "ping") continue
+                for (const out of raiser.handle(event as unknown as UpstreamEvent)) {
+                  push(frameEvent(out))
+                }
+              }
+              for (const out of raiser.finish()) {
+                push(frameEvent(out))
+              }
+            } catch (error) {
+              const message = error instanceof Error ? error.message : "stream interrupted"
+              push(frameEvent({ type: "error", error: { type: "api_error", message } }))
+            } finally {
+              clearInterval(heartbeat)
+              if (!closed) {
+                closed = true
+                controller.close()
+              }
+            }
+          },
+          cancel() {},
+        })
+        return new Response(stream, {
+          status: 200,
+          headers: {
+            "content-type": "text/event-stream; charset=utf-8",
+            "cache-control": "no-cache, no-transform",
+            connection: "keep-alive",
+            "x-accel-buffering": "no",
+          },
+        })
+      },
+    )
   }
 
   let upstream: Response
