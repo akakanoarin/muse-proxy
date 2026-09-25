@@ -90,6 +90,23 @@ function userContentParts(content: unknown): UpstreamInputItem[] | { error: true
 
   return { error: true }
 }
+function systemText(content: unknown): string | undefined {
+  if (typeof content === "string") return content
+  if (Array.isArray(content)) {
+    if (content.length === 0) return undefined
+    const texts: string[] = []
+    for (const part of content) {
+      if (!isRecord(part)) return undefined
+      if ((part.type === "text" || part.type === "input_text") && typeof part.text === "string") {
+        texts.push(part.text)
+        continue
+      }
+      return undefined
+    }
+    return texts.join("\n")
+  }
+  return undefined
+}
 
 // OpenRouter-style reasoning_details may also arrive as a custom array (from
 // gateways with their own format). We can't interpret those safely, so we
@@ -210,7 +227,7 @@ export function lowerRequest(chat: unknown, options: LowerOptions = {}): LowerRe
       if (role === "developer") {
         // OpenAI's developer role is a system instruction; accept it.
       }
-      const text = typeof entry.content === "string" ? entry.content : undefined
+      const text = systemText(entry.content)
       if (text === undefined) {
         return { error: { status: 400, message: "system message content must be a string" } }
       }

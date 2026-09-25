@@ -342,3 +342,39 @@ describe("lowerRequest: validation", () => {
     expect(err(lowerRequest({ messages: [{ role: "user", content: [{ type: "audio", audio: {} }] }] })).status).toBe(400)
   })
 })
+
+describe("lowerRequest: system array content", () => {
+  it("accepts string system content as before", () => {
+    const request = ok(lowerRequest({ messages: [{ role: "system", content: "sys" }, { role: "user", content: "hi" }] }))
+    expect(request.input[0]).toEqual({ role: "system", content: "sys" })
+  })
+
+  it("accepts a single text part array", () => {
+    const request = ok(
+      lowerRequest({ messages: [{ role: "system", content: [{ type: "text", text: "hello" }] }, { role: "user", content: "hi" }] }),
+    )
+    expect(request.input[0]).toEqual({ role: "system", content: "hello" })
+  })
+
+  it("joins multiple text parts with newlines", () => {
+    const request = ok(
+      lowerRequest({
+        messages: [{ role: "system", content: [{ type: "text", text: "a" }, { type: "text", text: "b" }] }, { role: "user", content: "hi" }],
+      }),
+    )
+    expect(request.input[0]).toEqual({ role: "system", content: "a\nb" })
+  })
+
+  it("accepts input_text parts", () => {
+    const request = ok(
+      lowerRequest({ messages: [{ role: "system", content: [{ type: "input_text", text: "hello" }] }, { role: "user", content: "hi" }] }),
+    )
+    expect(request.input[0]).toEqual({ role: "system", content: "hello" })
+  })
+
+  it("rejects invalid system content with 400", () => {
+    expect(err(lowerRequest({ messages: [{ role: "system", content: [{ type: "image_url", image_url: "x" }] }] })).status).toBe(400)
+    expect(err(lowerRequest({ messages: [{ role: "system", content: [] }] })).status).toBe(400)
+    expect(err(lowerRequest({ messages: [{ role: "system", content: 42 }] })).status).toBe(400)
+  })
+})

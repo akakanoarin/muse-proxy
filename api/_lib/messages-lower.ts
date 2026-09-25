@@ -82,7 +82,7 @@ function systemToText(value: unknown): string | undefined | { error: true } {
     const texts: string[] = []
     for (const part of value) {
       if (!isRecord(part) || typeof part.text !== "string") return { error: true }
-      if (part.type !== undefined && part.type !== "text") return { error: true }
+      if (part.type !== undefined && part.type !== "text" && part.type !== "input_text") return { error: true }
       texts.push(part.text)
     }
     return texts.join("\n")

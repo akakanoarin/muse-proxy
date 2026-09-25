@@ -109,14 +109,14 @@ function assistantContentToText(content: unknown): string | undefined {
   return undefined
 }
 
-// System/developer message content: a string or input_text parts.
+// System/developer message content: a string or input_text/text parts.
 function systemContentToText(content: unknown): string | undefined {
   if (typeof content === "string") return content
   if (Array.isArray(content)) {
     const texts: string[] = []
     for (const part of content) {
       if (!isRecord(part)) return undefined
-      if (part.type === "input_text" && typeof part.text === "string") {
+      if ((part.type === "input_text" || part.type === "text") && typeof part.text === "string") {
         texts.push(part.text)
         continue
       }
