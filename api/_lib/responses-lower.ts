@@ -27,7 +27,7 @@ import {
 import { appendClientTools } from "./tools.js"
 
 export type NormalizeResult =
-  | { request: UpstreamRequest; stream: boolean; clientToolNames: Set<string>; nsPrefixByBare: Map<string, string> }
+  | { request: UpstreamRequest; stream: boolean; clientToolNames: Set<string>; nsPrefixByBare: Map<string, string>; customToolNames: Set<string> }
   | { error: { status: number; message: string; code?: string } }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -143,7 +143,8 @@ function functionCallItem(item: Record<string, unknown>): UpstreamInputItem | { 
   // 终端回传名为 muse.muse__read_file（点号命名空间 + 双下划线工具名），
   // 上游只认识裸名 read_file，取最后一段剥离命名空间后透传。
   const name = rawName.split(".").pop()!.split("__").pop()!
-  const args = asString(item.arguments) ?? "{}"
+  // 原生 custom_tool_call 回放：input 为裸 JS 字符串，转写为 function 参数 JSON。
+  const args = asString(item.arguments) ?? (typeof item.input === "string" ? JSON.stringify({ input: item.input }) : "{}")
   return { type: "function_call", call_id: callId, name, arguments: args }
 }
 
@@ -205,12 +206,12 @@ function normalizeInputItem(
     return messageItem(entry, state)
   }
 
-  if (type === "function_call") {
+  if (type === "function_call" || type === "custom_tool_call") {
     const item = functionCallItem(entry)
     return "error" in item ? item : [item]
   }
 
-  if (type === "function_call_output") {
+  if (type === "function_call_output" || type === "custom_tool_call_output") {
     const item = functionCallOutputItem(entry)
     return "error" in item ? item : [item]
   }
@@ -249,11 +250,36 @@ function flattenNamespaceTools(value: unknown): Array<{ entry: unknown; nsPrefix
   }
   return out
 }
-function mergeToolsWithBuiltins(value: unknown): { tools: UpstreamTool[]; clientToolNames: Set<string>; nsPrefixByBare: Map<string, string> } {
+function customExecToFunction(entry: Record<string, unknown>): { name: string; description: string; parameters: Record<string, unknown> } | undefined {
+  const name = asString(entry.name)
+  if (name === undefined || name === "") return undefined
+  // codex 线程执行器把文件读写能力挂在顶层 custom/exec 沙箱嵌套工具里，
+  // 上游 responses 端点明确拒绝 type=custom（400 "`custom` tools are not
+  // supported on this endpoint"，2026-09-29 实测），原样透传必死。
+  // 转写为等名 function 工具：模型发起 function_call/exec，本地执行器照常
+  // 执行并回传 function_call_output，全链路复用现有 function 回放环。
+  // 描述压缩到首段（codex 原描述 16KB，每轮 62KB 重发是长会话中断帮凶之一，
+  // 上游 created 回显 tools 全量，68KB 回显挤占首包窗口）。
+  const fullDescription = asString(entry.description) ?? ""
+  const firstParagraph = fullDescription.split("\n\n")[0] ?? ""
+  const nestedHint = "Nested tools are available on the global `tools` object (e.g. await tools.exec_command(...)). File reads go through nested shell commands."
+  const description = firstParagraph.length > 0 ? `${firstParagraph} ${nestedHint}` : nestedHint
+  return {
+    name,
+    description: description.slice(0, 2000),
+    parameters: {
+      type: "object",
+      properties: { input: { type: "string", description: "Raw JavaScript source text orchestrating nested tool calls (native exec payload key)" } },
+      required: ["input"],
+    },
+  }
+}
+function mergeToolsWithBuiltins(value: unknown): { tools: UpstreamTool[]; clientToolNames: Set<string>; nsPrefixByBare: Map<string, string>; customToolNames: Set<string> } {
   const flat = flattenNamespaceTools(value)
   const client: UpstreamTool[] = []
   const names = new Set<string>()
   const nsPrefixByBare = new Map<string, string>()
+  const customToolNames = new Set<string>()
   for (const { entry, nsPrefix } of flat) {
     if (!isRecord(entry)) continue
     let name: string | undefined
@@ -273,6 +299,15 @@ function mergeToolsWithBuiltins(value: unknown): { tools: UpstreamTool[]; client
         parameters = isRecord(fn.parameters) ? fn.parameters : parameters
         if (typeof fn.strict === "boolean") strict = fn.strict
       }
+    } else if (entry.type === "custom" && asString(entry.name) !== undefined) {
+      // codex exec 沙箱：转写为同名 function 工具后上行（见上）。
+      // 仅收有名字符串的 custom 条目；web_search 等无名服务端工具仍忽略。
+      const converted = customExecToFunction(entry)
+      if (converted === undefined) continue
+      name = converted.name
+      description = converted.description
+      parameters = converted.parameters
+      customToolNames.add(converted.name)
     }
     if (name === undefined) continue
     const tool: UpstreamTool = {
@@ -286,7 +321,7 @@ function mergeToolsWithBuiltins(value: unknown): { tools: UpstreamTool[]; client
     names.add(name)
     if (nsPrefix !== undefined && !nsPrefixByBare.has(name)) nsPrefixByBare.set(name, nsPrefix)
   }
-  return { tools: appendClientTools(client), clientToolNames: names, nsPrefixByBare }
+  return { tools: appendClientTools(client), clientToolNames: names, nsPrefixByBare, customToolNames }
 }
 
 function clampMaxOutputTokens(value: unknown): number | undefined {
@@ -363,5 +398,5 @@ export function normalizeResponsesRequest(body: unknown, options: NormalizeOptio
   if (maxOutputTokens !== undefined) request.max_output_tokens = maxOutputTokens
 
   const wantsStream = body.stream === true
-  return { request, stream: wantsStream, clientToolNames: merged.clientToolNames, nsPrefixByBare: merged.nsPrefixByBare }
+  return { request, stream: wantsStream, clientToolNames: merged.clientToolNames, nsPrefixByBare: merged.nsPrefixByBare, customToolNames: merged.customToolNames }
 }

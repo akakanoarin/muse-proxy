@@ -60,6 +60,7 @@ export class ResponseBuilder {
   sawTerminalEvent = false
   clientToolNames: ReadonlySet<string> = new Set<string>()
   nsPrefixByBare: ReadonlyMap<string, string> = new Map<string, string>()
+  customToolNames: ReadonlySet<string> = new Set<string>()
 
   addEvent(raw: Record<string, unknown>) {
     const event = raw as unknown as UpstreamEvent
@@ -73,9 +74,27 @@ export class ResponseBuilder {
     }
 
     if (event.type === "response.output_item.done" && event.item) {
-      const item = event.item as unknown as OutputItem & { name?: unknown }
+      const item = event.item as unknown as OutputItem & { name?: unknown; arguments?: unknown }
       if (item.type === "function_call" && typeof item.name === "string") {
         const toolName: string = item.name
+        // custom 转写工具（如 codex exec）：下行重写为原生 custom_tool_call，
+        // 本地线程执行器只接受 custom 信封，function 形必报 incompatible payload。
+        if (this.customToolNames.has(toolName)) {
+          const rawArgs = typeof item.arguments === "string" ? item.arguments : "{}"
+          let input = rawArgs
+          try {
+            const parsed: unknown = JSON.parse(rawArgs)
+            if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+              const record = parsed as Record<string, unknown>
+              const inner = record.input ?? record.code
+              if (typeof inner === "string") input = inner
+            }
+          } catch {}
+          const rewritten: Record<string, unknown> = { ...(item as Record<string, unknown>), type: "custom_tool_call", input }
+          delete rewritten.arguments
+          this.output.push(rewritten)
+          return
+        }
         const prefix = this.nsPrefixByBare.get(toolName)
         if (prefix !== undefined && !toolName.startsWith(`${prefix}__`)) item.name = `${prefix}__${toolName}`
         if (!shouldExposeToolCall(item.name as string, this.clientToolNames)) return
@@ -363,6 +382,7 @@ export async function handleResponsesRequest(
     const builder = new ResponseBuilder()
     builder.clientToolNames = normalized.clientToolNames
     builder.nsPrefixByBare = normalized.nsPrefixByBare
+    builder.customToolNames = normalized.customToolNames
     for await (const event of events) {
       if (event === "done") break
       builder.addEvent(event)
@@ -413,6 +433,7 @@ export async function handleResponsesRequest(
       try {
         let sawTerminalEvent = false
         const clientToolNames = normalized.clientToolNames
+        const customToolNames = normalized.customToolNames
         // 隐藏内置工具调用的 item id 集合：output_item.added 里记下，
         // 后续 arguments.delta/done 按 item_id 丢弃。必须全序列丢弃
         // （added + delta + done + output_item.done）：只丢 done 会留下
@@ -430,6 +451,13 @@ export async function handleResponsesRequest(
           if (event.type === "ping") continue
           if (event.type === "response.output_item.added") {
             const item = event.item as Record<string, unknown> | undefined
+            if (item?.type === "function_call" && typeof item.name === "string" && customToolNames.has(item.name)) {
+              // custom 转写工具新增事件同步重写，本地执行器按 custom 信封建调用。
+              const rewritten: Record<string, unknown> = { ...(item as Record<string, unknown>), type: "custom_tool_call", input: "" }
+              delete rewritten.arguments
+              push(frameEvent({ ...(event as Record<string, unknown>), item: rewritten }))
+              continue
+            }
             if (item?.type === "function_call" && typeof item.name === "string" && !shouldExposeToolCall(item.name, clientToolNames)) {
               if (typeof item.id === "string") hiddenItemIds.add(item.id)
               continue
@@ -444,8 +472,25 @@ export async function handleResponsesRequest(
           }
           if (event.type === "response.output_item.done") {
             const item = (event as Record<string, unknown>).item as Record<string, unknown> | undefined
-            if (item?.type === "function_call" && typeof item.name === "string" && !shouldExposeToolCall(item.name, clientToolNames)) {
-              if (typeof item.id === "string") hiddenItemIds.delete(item.id)
+            if (item?.type === "function_call" && typeof item.name === "string" && customToolNames.has(item.name)) {
+              const argsText = typeof item.arguments === "string" ? item.arguments : "{}"
+              let input = argsText
+              try {
+                const parsed: unknown = JSON.parse(argsText)
+                if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+                  const record = parsed as Record<string, unknown>
+                  const inner = record.input ?? record.code
+                  if (typeof inner === "string") input = inner
+                }
+              } catch {}
+              const rewritten: Record<string, unknown> = { ...(item as Record<string, unknown>), type: "custom_tool_call", input }
+              delete rewritten.arguments
+              push(frameEvent({ ...(event as Record<string, unknown>), item: rewritten }))
+              continue
+            }
+            const doneItem = (event as Record<string, unknown>).item as Record<string, unknown> | undefined
+            if (doneItem?.type === "function_call" && typeof doneItem.name === "string" && !shouldExposeToolCall(doneItem.name, clientToolNames)) {
+              if (typeof doneItem.id === "string") hiddenItemIds.delete(doneItem.id)
               continue
             }
           }
@@ -455,11 +500,31 @@ export async function handleResponsesRequest(
             const response = event.response as Record<string, unknown> | undefined
             const output = response?.output
             if (response && Array.isArray(output)) {
-              response.output = output.filter((entry) => {
-                if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return true
-                const record = entry as Record<string, unknown>
-                return !(record.type === "function_call" && typeof record.name === "string" && !shouldExposeToolCall(record.name, clientToolNames))
-              })
+              response.output = output
+                .filter((entry) => {
+                  if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return true
+                  const record = entry as Record<string, unknown>
+                  return !(record.type === "function_call" && typeof record.name === "string" && !shouldExposeToolCall(record.name, clientToolNames))
+                })
+                .map((entry) => {
+                  if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return entry
+                  const record = entry as Record<string, unknown>
+                  if (record.type === "function_call" && typeof record.name === "string" && customToolNames.has(record.name)) {
+                    const argsText = typeof record.arguments === "string" ? record.arguments : "{}"
+                    let input = argsText
+                    try {
+                      const parsed: unknown = JSON.parse(argsText)
+                      if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+                        const inner = (parsed as Record<string, unknown>).input ?? (parsed as Record<string, unknown>).code
+                        if (typeof inner === "string") input = inner
+                      }
+                    } catch {}
+                    const rewritten: Record<string, unknown> = { ...record, type: "custom_tool_call", input }
+                    delete rewritten.arguments
+                    return rewritten
+                  }
+                  return entry
+                })
             }
             sawTerminalEvent = true
           } else if (event.type === "response.failed" || event.type === "error") {
@@ -468,6 +533,10 @@ export async function handleResponsesRequest(
           push(frameEvent(event))
         }
         if (!sawTerminalEvent) {
+          // 客户端主动断开（超时/取消/平台回收）时 request.signal 已中止，
+          // 上游 reader.read() 抛 AbortError：静默关流，不再合成 truncated
+          // 或 proxy_stream_error 误导客户端重报“会话中断”。
+          if (request.signal.aborted) return
           // Upstream closed the connection without a terminal event (e.g. a
           // mid-generation EOF). Never let the stream end silently: clients
           // would treat truncated output as a complete response.
@@ -478,6 +547,8 @@ export async function handleResponsesRequest(
           }))
         }
       } catch (error) {
+        // 同上：客户端取消静默关流；仅非取消异常才合成错误帧。
+        if (request.signal.aborted || (error instanceof Error && error.name === "AbortError")) return
         const message = error instanceof Error ? error.message : "stream interrupted"
         push(frameEvent({ type: "error", code: "proxy_stream_error", message }))
       } finally {

@@ -125,6 +125,63 @@ describe("normalizeResponsesRequest", () => {
       { type: "function_call_output", call_id: "c1", output: "ok" },
     ])
   })
+  it("rewrites codex custom exec tools to upstream functions with trimmed descriptions", () => {
+    const longDescription = `${"Run JavaScript code to orchestrate tool calls. "}\n\n${"x".repeat(20_000)}`
+    const result = normalizeResponsesRequest({
+      input: "hi",
+      tools: [
+        { type: "custom", name: "exec", description: longDescription, format: { type: "grammar", syntax: "lark", definition: "start: SOURCE" } },
+        { type: "web_search", external_web_access: true },
+      ],
+    })
+    if ("error" in result) throw new Error("unexpected error")
+    // custom/exec 转写为 function 上行（上游拒收 type=custom），无名 web_search 仍忽略。
+    expect(result.clientToolNames.has("exec")).toBe(true)
+    const sent = result.request.tools!.find((tool) => tool.name === "exec")!
+    expect(sent.type).toBe("function")
+    expect(sent.description.length).toBeLessThanOrEqual(2000)
+    expect(sent.parameters).toEqual({
+      type: "object",
+      properties: { input: { type: "string", description: "Raw JavaScript source text orchestrating nested tool calls (native exec payload key)" } },
+      required: ["input"],
+    })
+    expect(result.request.tools!.every((tool) => tool.type === "function")).toBe(true)
+  })
+
+
+  it("tracks rewritten custom tools and accepts custom_tool_call_output replay", () => {
+    const result = normalizeResponsesRequest({
+      input: "hi",
+      tools: [{ type: "custom", name: "exec", description: "Run JS.", format: { type: "grammar", syntax: "lark", definition: "start: SOURCE" } }],
+    })
+    if ("error" in result) throw new Error("unexpected error")
+    expect(result.customToolNames.has("exec")).toBe(true)
+    const replay = normalizeResponsesRequest({
+      input: [
+        { type: "function_call", call_id: "c1", name: "exec", arguments: '{"input":"1+1"}' },
+        { type: "custom_tool_call_output", call_id: "c1", output: "2" },
+      ],
+    })
+    if ("error" in replay) throw new Error("unexpected error")
+    expect(replay.request.input).toEqual([
+      { type: "function_call", call_id: "c1", name: "exec", arguments: '{"input":"1+1"}' },
+      { type: "function_call_output", call_id: "c1", output: "2" },
+    ])
+  })
+
+  it("accepts custom_tool_call replay items for upstream", () => {
+    const replay = normalizeResponsesRequest({
+      input: [
+        { type: "custom_tool_call", call_id: "c9", name: "exec", input: "1+1" },
+        { type: "custom_tool_call_output", call_id: "c9", output: "2" },
+      ],
+    })
+    if ("error" in replay) throw new Error("unexpected error")
+    expect(replay.request.input).toEqual([
+      { type: "function_call", call_id: "c9", name: "exec", arguments: '{"input":"1+1"}' },
+      { type: "function_call_output", call_id: "c9", output: "2" },
+    ])
+  })
 
   it("drops all reasoning replay items (session-bound blobs rejected upstream)", () => {
     const result = normalizeResponsesRequest({
@@ -619,6 +676,64 @@ describe("responses endpoint integration", () => {
     expect(types.filter((type) => type === "response.function_call_arguments.delta")).toHaveLength(1)
     expect(text).toContain("fc_client")
     expect(types.at(-1)).toBe("response.completed")
+  })
+
+  it("streaming: rewrites upstream function_call/exec to custom_tool_call downstream", async () => {
+    mockUpstream([
+      sseResponse([
+        {
+          type: "response.output_item.added",
+          item: { id: "fc_e1", type: "function_call", name: "exec", call_id: "call_e1", arguments: "" },
+        },
+        {
+          type: "response.output_item.done",
+          item: { id: "fc_e1", type: "function_call", name: "exec", call_id: "call_e1", arguments: '{"input":"1+1"}' },
+        },
+        { type: "response.completed", response: { usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } } },
+      ]),
+    ])
+    const res = await handleResponsesRequest(
+      post({
+        input: "hi",
+        stream: true,
+        tools: [{ type: "custom", name: "exec", description: "Run JS.", format: { type: "grammar", syntax: "lark", definition: "start: SOURCE" } }],
+      }),
+      ENV,
+    )
+    const text = await res.text()
+    expect(text).toContain('"custom_tool_call"')
+    expect(text).toContain('"input":"1+1"')
+    expect(text).not.toContain('"function_call"')
+    const types = text.split("\n\n").filter((block) => block.startsWith("event: ")).map((frame) => frame.split("\n")[0]!.slice("event: ".length))
+    expect(types.at(-1)).toBe("response.completed")
+  })
+
+  it("streaming: client abort closes silently without a synthetic error event", async () => {
+    const controller = new AbortController()
+    const hanging = new Response(
+      new ReadableStream<Uint8Array>({
+        start(ctrl) {
+          ctrl.enqueue(new TextEncoder().encode('data: {"type":"response.created","response":{"id":"resp_abort"}}\n\n'))
+          controller.signal.addEventListener("abort", () => {
+            ctrl.error(new DOMException("The operation was aborted.", "AbortError"))
+          })
+        },
+      }),
+      { headers: { "content-type": "text/event-stream" } },
+    )
+    const deps = { fetchImpl: (async () => hanging) as typeof fetch }
+    const req = new Request("http://localhost/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...AUTH },
+      body: JSON.stringify({ input: "hi", stream: true }),
+      signal: controller.signal,
+    })
+    const res = await handleResponsesRequest(req, ENV, deps)
+    const readPromise = res.text()
+    controller.abort()
+    const text = await readPromise
+    expect(text).not.toContain("proxy_stream_error")
+    expect(text).not.toContain("upstream_stream_truncated")
   })
 
   it("drops multi-turn encrypted reasoning replay instead of sending it upstream", async () => {
